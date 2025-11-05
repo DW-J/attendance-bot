@@ -16,7 +16,9 @@ logs = sh.worksheet("logs")
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 KST = pytz.timezone("Asia/Seoul")
 
+# 캐시
 user_cache = {}
+user_email_cache = {}
 
 def resolve_user_name(client, user_id):
     try:
@@ -26,19 +28,27 @@ def resolve_user_name(client, user_id):
     except Exception:
         return user_id
     
-def append_log(user_id, user_name, type_, note="", date_str="", by_user=None):
-    now = dt.datetime.now(KST).isoformat(timespec="seconds")
-    type_ = (type_ or "").strip()
-    note = (note or "").strip()
-    date_str = (date_str or "").strip()
-    # 휴무/연차는 YYYY-MM-DD 필요. 없으면 오늘 날짜로 보정
-    if type_ in ("annual","off") and not date_str:
-        date_str = dt.datetime.now(KST).date().isoformat()
-        
-    row = [now, user_id, user_name, type_, note, date_str, "auto", by_user or user_id]
+def resolve_user_email(client, user_id: str) -> str:
+    # 스코프: users:read.email
+    if user_id in user_email_cache:
+        return user_email_cache[user_id]
+    try:
+        info = client.users_info(user=user_id)
+        email = info["user"]["profile"].get("email")
+        if email:
+            user_email_cache[user_id] = email
+            return email
+    except Exception:
+        pass
+    # 실패 시 Slack ID로 폴백
+    return user_id
     
-    # A1:H1을 표 헤더 범위로 고정 -> 항상 A열부터 append
+def append_log(user_key, user_name, type_, note="", date_str="", by_user=None):
+    # user_key, by_user에는 이제 이메일 또는 ID가 들어옴
+    now = dt.datetime.now(KST).isoformat(timespec="seconds")
+    row = [now, user_key, user_name or "", type_, note, date_str, "auto", by_user or user_key]
     logs.append_rows([row], value_input_option="USER_ENTERED", table_range="A1:H1")
+
 
 # ---------- 뷰 생성기 ----------
 def build_attendance_view(selected_action=None, preserved=None):
@@ -139,16 +149,18 @@ def on_mention(body, say):
 def 출근_cmd(ack, body, respond, client):
     ack()
     uid = body["user_id"]
-    uname = resolve_user_name(client, uid)
-    append_log(uid, uname, "출근")  # user_name 컬럼 채움
+    email = resolve_user_email(client, uid)    # ← 이메일
+    uname = resolve_user_name(client, uid)     # 선택사항
+    append_log(email, uname, "checkin", by_user=email)
     respond(f"{uname} 출근 등록 완료")
 
 @app.command("/퇴근")
 def 퇴근_cmd(ack, body, respond, client):
     ack()
     uid = body["user_id"]
+    email = resolve_user_email(client, uid)
     uname = resolve_user_name(client, uid)
-    append_log(uid, uname, "퇴근")
+    append_log(email, uname, "checkout", by_user=email)
     respond(f"{uname} 퇴근 등록 완료")
 
 @app.message(re.compile(r"^\s*(출근|퇴근)\s*$"))
@@ -206,6 +218,9 @@ def 근태_submit(ack, body, view, client):
 
     # 통과
     ack()
+    uid = body["user"]["id"]
+    email = resolve_user_email(client, uid)
+    uname = resolve_user_name(client, uid)
 
     # 사용자명 조회(스코프 없으면 ID로 대체)
     try:
@@ -221,7 +236,7 @@ def 근태_submit(ack, body, view, client):
     if action == "halfday" and half_period:
         note = f"{note} (오전)" if half_period == "am" else f"{note} (오후)"
 
-    append_log(user_id, user_name, action, note=note, date_str=(selected_date or ""))
+    append_log(email, uname, action, note=note, date_str=(selected_date or ""), by_user=email)
 
     # 에페메럴 알림
     meta = json.loads(view.get("private_metadata") or "{}")
