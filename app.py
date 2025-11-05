@@ -5,6 +5,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import gspread
 from google.oauth2.service_account import Credentials
 import json
+import unicodedata as ud
 
 load_dotenv()
 
@@ -19,9 +20,113 @@ KST = pytz.timezone("Asia/Seoul")
 ADMIN_ID_SET = {s.strip() for s in (os.getenv("ADMIN_IDS") or "").split(",") if s.strip()}
 ADMIN_EMAIL_SET = {e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()}
 
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 # 캐시
 user_cache = {}
 user_email_cache = {}
+
+def date_to_iso_week_kst(date_str: str) -> str:
+    y, m, d = map(int, date_str.split("-"))
+    day = dt.datetime(y, m, d, tzinfo=KST).date()
+    Y, W, _ = day.isocalendar()
+    return f"{Y}-W{W:02d}"
+
+def available_weeks_for_user(ukey: str):
+    ws = get_ws("schedule_weekly")
+    vals = ws.get_all_values()
+    if not vals:
+        return []
+    header = [h.strip() for h in vals[0]]
+    try:
+        wi = header.index("week"); ui = header.index("user_key")
+    except ValueError:
+        return []
+    out = set()
+    for r in vals[1:]:
+        wk = r[wi].strip() if wi < len(r) else ""
+        uk = r[ui].strip() if ui < len(r) else ""
+        if uk.lower() == (ukey or "").strip().lower():
+            out.add(wk)
+    return sorted(out)
+
+def get_ws(name: str):
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        raise RuntimeError(f"시트 '{name}'를 찾을 수 없습니다.")
+    
+def sheet_rows_as_dicts(ws, header_row=1):
+    vals = ws.get_all_values()
+    if len(vals) < header_row:
+        return []
+    headers = [h.strip() for h in vals[header_row-1]]
+    rows = []
+    for r in vals[header_row:]:
+        row = {}
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            row[h] = r[i] if i < len(r) else ""
+        rows.append(row)
+    return rows
+
+def find_balance_row_for(user_key: str):
+    ws = get_ws("balances")
+    rows = sheet_rows_as_dicts(ws)
+    # user_key 완전일치 1순위
+    for r in rows:
+        if (r.get("user_key") or "").strip().lower() == (user_key or "").strip().lower():
+            return r
+    # 이메일/ID 혼용 대비: 끝 공백 제거 후 비교
+    for r in rows:
+        if (r.get("user_key") or "").strip() == (user_key or "").strip():
+            return r
+    return None
+
+ISO_WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
+
+def current_iso_week_kst() -> str:
+    today = dt.datetime.now(KST).date()
+    y, w, _ = today.isocalendar()
+    return f"{y}-W{w:02d}"
+
+def find_schedule_for(week: str, user_key: str):
+    ws = get_ws("schedule_weekly")
+    rows = sheet_rows_as_dicts(ws)
+    # week, user_key 모두 일치하는 첫 행
+    for r in rows:
+        if (r.get("week")==week) and ((r.get("user_key") or "").strip().lower()==(user_key or "").strip().lower()):
+            return r
+    # user_key 느슨 비교
+    for r in rows:
+        if (r.get("week")==week) and ((r.get("user_key") or "").strip()==(user_key or "").strip()):
+            return r
+    return None
+
+def safe_user_key(client, slack_user_id: str) -> str:
+    """이메일 우선. 실패 시 Slack ID."""
+    try:
+        info = client.users_info(user=slack_user_id)
+        email = info["user"]["profile"].get("email")
+        return email or slack_user_id
+    except Exception:
+        return slack_user_id
+
+def safe_user_name(client, slack_user_id: str) -> str:
+    try:
+        info = client.users_info(user=slack_user_id)
+        p = info["user"]["profile"]
+        return p.get("display_name") or p.get("real_name") or slack_user_id
+    except Exception:
+        return slack_user_id
+
+def reply_error(respond, msg="오류가 발생했습니다. 잠시 후 다시 시도하세요."):
+    try:
+        respond(msg)
+    except Exception:
+        pass
 
 def resolve_user_name(client, user_id):
     try:
@@ -53,6 +158,16 @@ def is_admin(user_id: str, client=None) -> bool:
         email = resolve_user_email(client, user_id)
         return (email or "").lower() in ADMIN_EMAIL_SET
     return False
+
+# ---------- 에러 핸들러 데코레이터 : 슬래시 커맨드에서 예외 발생 시 통일 메시지. ----------
+def slash_guard(fn):
+    def _w(ack, body, respond, *args, **kwargs):
+        try:
+            return fn(ack, body, respond, *args, **kwargs)
+        except Exception as e:
+            reply_error(respond, f"처리 중 오류: {e}")
+    return _w
+
 
 # ---------- 뷰 생성기 ----------
 def build_attendance_view(selected_action=None, preserved=None):
@@ -206,6 +321,35 @@ def build_admin_view():
             },
         ]
     }
+  
+def disp_width(s: str) -> int:
+    w = 0
+    for ch in s or "":
+        e = ud.east_asian_width(ch)
+        w += 2 if e in ("W","F") else 1
+    return w
+
+def pad_right(s: str, target: int) -> str:
+    w = disp_width(s)
+    return s + " " * max(0, target - w)  
+  
+def render_week_table(week: str, r: dict) -> str:
+    cols = [("월", r.get("Mon", "-") or "-"),
+            ("화", r.get("Tue", "-") or "-"),
+            ("수", r.get("Wed", "-") or "-"),
+            ("목", r.get("Thu", "-") or "-"),
+            ("금", r.get("Fri", "-") or "-"),
+            ("토", r.get("Sat", "-") or "-"),
+            ("일", r.get("Sun", "-") or "-")]
+
+    # 각 칸 최소폭 2. 헤더/값 중 큰 표시폭으로 고정
+    widths = []
+    for k, v in cols:
+        widths.append(max(2, disp_width(k), disp_width(v)))
+    header = " ".join(pad_right(k, w) for (k, _), w in zip(cols, widths))
+    values = " ".join(pad_right(v, w) for (_, v), w in zip(cols, widths))
+
+    return f"*{week} 주간 스케줄*\n```{header}\n{values}```"
   
 @app.event("app_mention")
 def on_mention(body, say):
@@ -362,6 +506,68 @@ def admin_submit(ack, body, view, client):
             client.chat_postMessage(channel=channel, text=f"[관리자 대리입력] {target_name} {action} 등록 완료")
     except Exception:
         pass
+
+@app.command("/잔여")
+def 잔여_cmd(ack, body, respond, client):
+    ack()
+    uid = body["user_id"]
+    ukey = safe_user_key(client, uid)
+    row = None
+    try:
+        row = find_balance_row_for(ukey)
+    except Exception as e:
+        reply_error(respond, f"balances 시트 조회 실패: {e}")
+        return
+
+    if not row:
+        respond("잔여 정보를 찾을 수 없습니다. 관리자가 balances 시트를 업데이트해야 합니다.")
+        return
+
+    total = row.get("annual_total") or "0"
+    used  = row.get("annual_used")  or "0"
+    left  = row.get("annual_left")  or "0"
+    half  = row.get("half_used")    or "0"
+    uname = row.get("user_name")    or safe_user_name(client, uid)
+
+    blocks = [
+        {"type": "header", "text": {"type":"plain_text","text":"연차 잔여 요약"}},
+        {"type": "section","fields":[
+            {"type":"mrkdwn","text":f"*이름*\n{uname}"},
+            {"type":"mrkdwn","text":f"*식별자*\n{ukey}"},
+            {"type":"mrkdwn","text":f"*총 연차*\n{total}"},
+            {"type":"mrkdwn","text":f"*사용*\n{used}"},
+            {"type":"mrkdwn","text":f"*잔여*\n*{left}*"},
+            {"type":"mrkdwn","text":f"*반차 사용*\n{half}"},
+        ]},
+        {"type":"context","elements":[{"type":"mrkdwn","text":"balances 시트 기준"}]}
+    ]
+    respond(blocks=blocks, text="잔여 요약")
+
+@app.command("/스케줄")
+def 스케줄_cmd(ack, body, respond, client):
+    ack()
+    text = (body.get("text") or "").strip()
+    if ISO_WEEK_RE.match(text):
+        week = text
+    elif DATE_RE.match(text):
+        week = date_to_iso_week_kst(text)
+    else:
+        week = current_iso_week_kst()
+
+    uid = body["user_id"]
+    ukey = safe_user_key(client, uid)
+    try:
+        r = find_schedule_for(week, ukey)
+    except Exception as e:
+        reply_error(respond, f"schedule_weekly 시트 조회 실패: {e}")
+        return
+
+    if not r:
+        sugg = available_weeks_for_user(ukey)
+        respond(f"{week} 주차 스케줄 없음. 사용 가능한 주: {', '.join(sugg[:10])}" if sugg else f"{ukey} 행이 없습니다.")
+        return
+
+    respond(text=render_week_table(week, r))
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
