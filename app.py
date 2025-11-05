@@ -27,6 +27,165 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 user_cache = {}
 user_email_cache = {}
 
+def parse_date(s):
+    try:
+        y,m,d = map(int, s.split("-")); return dt.date(y,m,d)
+    except Exception: return None
+    
+def logs_usage_since(user_key: str, since_date=None):
+    ws = sh.worksheet("logs")
+    vals = ws.get_all_values()
+    if not vals: return 0.0
+    head = [h.strip().lower() for h in vals[0]]
+    i_user = head.index("user_id") if "user_id" in head else head.index("user_key")
+    i_type = head.index("type"); i_date = head.index("date")
+    used = 0.0
+    for r in vals[1:]:
+        uk = (r[i_user] if i_user < len(r) else "").strip()
+        if uk.lower() != (user_key or "").strip().lower(): continue
+        t = (r[i_type] if i_type < len(r) else "").strip().lower()
+        d = (r[i_date] if i_date < len(r) else "").strip()
+        dd = parse_date(d)
+        if since_date and (not dd or dd < since_date):  # 기준일 전 기록은 제외
+            continue
+        if t == "annual": used += 1.0
+        elif t == "halfday": used += 0.5
+    return used
+
+def get_balance_row_map():
+    ws = sh.worksheet("balances")
+    vals = ws.get_all_values()
+    if not vals: return ws, {}, []
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h:i for i,h in enumerate(head)}
+    rows = vals
+    pos = {}  # user_key(lower) -> rownum(1-based)
+    for rn, r in enumerate(rows[1:], start=2):
+        uk = (r[idx.get("user_key",0)] if idx.get("user_key",0) < len(r) else "").strip().lower()
+        if uk: pos[uk] = rn
+    return ws, idx, rows, pos
+
+def effective_left_for(user_key: str):
+    ws, idx, rows, pos = get_balance_row_map()
+    rn = pos.get((user_key or "").strip().lower())
+    if not rn: return None  # balances에 행이 없음
+    row = rows[rn-1]
+    def get(name, default=""):
+        i = idx.get(name); return (row[i] if i is not None and i < len(row) else default)
+    # 우선 override 기반
+    o_left = get("override_left","")
+    o_from = get("override_from","")
+    if o_left:
+        base = float(o_left)
+        since = parse_date(o_from) if DATE_RE.match(o_from or "") else None
+        used = logs_usage_since(user_key, since_date=since)
+        return max(0.0, base - used)
+    # 없으면 기존 total-집계 방식(연도 기준)
+    total = float(get("annual_total","0") or 0)
+    # 올해 사용 합산
+    year = dt.datetime.now(KST).year
+    used = 0.0
+    ws_logs = sh.worksheet("logs")
+    vals = ws_logs.get_all_values()
+    head = [h.strip().lower() for h in vals[0]]
+    i_user = head.index("user_id") if "user_id" in head else head.index("user_key")
+    i_type = head.index("type"); i_date = head.index("date")
+    for r in vals[1:]:
+        uk = (r[i_user] if i_user < len(r) else "").strip()
+        if uk.lower() != (user_key or "").strip().lower(): continue
+        t = (r[i_type] if i_type < len(r) else "").strip().lower()
+        dd = parse_date((r[i_date] if i_date < len(r) else "").strip())
+        if not dd or dd.year != year: continue
+        used += 1.0 if t=="annual" else (0.5 if t=="halfday" else 0.0)
+    return max(0.0, total - used)
+
+def build_override_view(initial_left:str="", initial_date:str=""):
+    return {
+      "type":"modal","callback_id":"override_submit",
+      "title":{"type":"plain_text","text":"잔여 기준선 설정"},
+      "submit":{"type":"plain_text","text":"저장"},
+      "close":{"type":"plain_text","text":"취소"},
+      "blocks":[
+        {"type":"input","block_id":"target_b","label":{"type":"plain_text","text":"대상자"},
+         "element":{"type":"users_select","action_id":"target"}},
+        {"type":"input","block_id":"left_b","label":{"type":"plain_text","text":"기준선 잔여일수(예: 12.5)"},
+         "element":{"type":"plain_text_input","action_id":"left"}},
+        {"type":"input","block_id":"from_b","label":{"type":"plain_text","text":"기준 적용 시작일"},
+         "element":{"type":"datepicker","action_id":"from_date"}},
+        {"type":"input","block_id":"note_b","optional":True,"label":{"type":"plain_text","text":"비고"},
+         "element":{"type":"plain_text_input","action_id":"note"}}
+      ]}
+
+def recompute_balances(target_year=None):
+    year = target_year or dt.datetime.now(KST).year
+    ws_logs = sh.worksheet("logs")
+    vals = ws_logs.get_all_values()  # A:H
+    if not vals: return
+    head = [h.strip().lower() for h in vals[0]]
+    get = lambda col: head.index(col)
+
+    i_user_key = get("user_id") if "user_id" in head else get("user_key")
+    i_user_name = get("user_name")
+    i_type = get("type")
+    i_date = get("date")
+
+    used = {}   # user_key -> {'name':..., 'annual':x, 'half':y}
+    for r in vals[1:]:
+        if len(r) <= max(i_user_key,i_user_name,i_type,i_date): continue
+        ukey = (r[i_user_key] or "").strip()
+        if not ukey: continue
+        t = (r[i_type] or "").strip().lower()
+        d = parse_date((r[i_date] or "").strip())
+        # 연차/반차만 집계. 날짜 없으면 올해로 간주하지 않음
+        if t not in ("annual","halfday"): 
+            continue
+        if not d or d.year != year:
+            continue
+        if ukey not in used:
+            used[ukey] = {"name": (r[i_user_name] or "").strip(), "annual":0.0, "half":0.0}
+        if t == "annual": used[ukey]["annual"] += 1.0
+        elif t == "halfday": used[ukey]["half"] += 0.5
+
+    ws_bal = sh.worksheet("balances")
+    bal_vals = ws_bal.get_all_values()
+    if not bal_vals:
+        ws_bal.append_row(["user_key","user_name","annual_total","annual_used","annual_left","half_used","notes"])
+        bal_vals = ws_bal.get_all_values()
+    bhead = [h.strip().lower() for h in bal_vals[0]]
+    # 보장 헤더
+    need = ["user_key","user_name","annual_total","annual_used","annual_left","half_used","notes"]
+    for n in need:
+        if n not in bhead: raise RuntimeError("balances 헤더 불일치: " + ",".join(need))
+
+    # 기존 인덱스
+    idx_map = { (row[0] or "").strip().lower(): i for i,row in enumerate(bal_vals[1:], start=2) }  # user_key -> rownum
+
+    updates = []
+    for ukey, agg in used.items():
+        rownum = idx_map.get(ukey.lower())
+        # annual_total이 없으면 0으로 가정
+        if rownum:
+            total = bal_vals[rownum-1][2] if len(bal_vals[rownum-1])>2 else "0"
+        else:
+            total = "0"
+        try:
+            total_f = float(total)
+        except:
+            total_f = 0.0
+        annual_used = agg["annual"]
+        half_used = agg["half"]
+        annual_left = max(0.0, total_f - (annual_used + half_used))
+        row = [ukey, agg["name"], str(total_f), annual_used, annual_left, half_used, ""]
+        if rownum:
+            updates.append((rownum, row))
+        else:
+            ws_bal.append_row(row)
+            idx_map[ukey.lower()] = ws_bal.row_count
+
+    # 벌크 업데이트
+    for rownum, row in updates:
+        ws_bal.update(f"A{rownum}:G{rownum}", [row], value_input_option="USER_ENTERED")
+
 def date_to_iso_week_kst(date_str: str) -> str:
     y, m, d = map(int, date_str.split("-"))
     day = dt.datetime(y, m, d, tzinfo=KST).date()
@@ -155,8 +314,12 @@ def is_admin(user_id: str, client=None) -> bool:
         return True
     # 2) 이메일 화이트리스트
     if client and ADMIN_EMAIL_SET:
-        email = resolve_user_email(client, user_id)
-        return (email or "").lower() in ADMIN_EMAIL_SET
+        try:
+            info = client.users_info(user=user_id)
+            email = (info["user"]["profile"].get("email") or "").lower()
+            return email in ADMIN_EMAIL_SET
+        except Exception:
+            return False
     return False
 
 # ---------- 에러 핸들러 데코레이터 : 슬래시 커맨드에서 예외 발생 시 통일 메시지. ----------
@@ -513,14 +676,15 @@ def 잔여_cmd(ack, body, respond, client):
     uid = body["user_id"]
     ukey = safe_user_key(client, uid)
     row = None
+    eff = effective_left_for(ukey)
     try:
         row = find_balance_row_for(ukey)
     except Exception as e:
         reply_error(respond, f"balances 시트 조회 실패: {e}")
         return
 
-    if not row:
-        respond("잔여 정보를 찾을 수 없습니다. 관리자가 balances 시트를 업데이트해야 합니다.")
+    if eff is None:
+        respond("balances에 사용자 행이 없습니다. 관리자에게 문의하세요.")
         return
 
     total = row.get("annual_total") or "0"
@@ -568,6 +732,68 @@ def 스케줄_cmd(ack, body, respond, client):
         return
 
     respond(text=render_week_table(week, r))
+
+@app.command("/잔여갱신")
+def 잔여갱신_modal(ack, body, client, respond):
+    ack()
+    if not is_admin(body["user_id"], client):
+        respond("권한 없음.")
+        return
+    today = dt.datetime.now(KST).date().isoformat()
+    client.views_open(trigger_id=body["trigger_id"],
+                      view=build_override_view(initial_left="", initial_date=today))
+    
+@app.view("override_submit")
+def 잔여갱신_submit(ack, body, view, client):
+    vals = view["state"]["values"]
+    target_uid = vals["target_b"]["target"]["selected_user"]
+    left_str = (vals["left_b"]["left"]["value"] or "").strip()
+    from_date = vals["from_b"]["from_date"].get("selected_date")
+    note = (vals.get("note_b",{}).get("note",{}).get("value") or "").strip()
+    errors = {}
+    try:
+        left_val = float(left_str)
+        if left_val < 0: errors["left_b"] = "0 이상 입력"
+    except Exception:
+        errors["left_b"] = "숫자 형식으로 입력"
+    if not from_date: errors["from_b"] = "기준 시작일 선택"
+    if errors:
+        ack(response_action="errors", errors=errors); return
+    ack()
+
+    # 키 해석
+    ukey = safe_user_key(client, target_uid)
+    uname = safe_user_name(client, target_uid)
+
+    # balances upsert
+    ws, idx, rows, pos = get_balance_row_map()
+    rn = pos.get((ukey or "").strip().lower())
+    now_iso = dt.datetime.now(KST).isoformat(timespec="seconds")
+    # 보장 헤더
+    need = ["user_key","user_name","annual_total","annual_used","annual_left","half_used","override_left","override_from","last_admin_update","notes"]
+    if rows:
+        head = [h.strip().lower() for h in rows[0]]
+        if any(n not in head for n in ["user_key","user_name"]):
+            raise RuntimeError("balances 헤더에 user_key/user_name 필요")
+    # 새 행
+    row = [ukey, uname, "", "", "", "", str(left_val), from_date, now_iso, note]
+    if rn:
+        ws.update(
+            range_name=f"A{rn}:J{rn}",
+            values=[row],
+            value_input_option="USER_ENTERED",
+        )
+    else:
+        # 헤더가 없다면 추가
+        if not rows:
+            ws.append_row(["user_key","user_name","annual_total","annual_used","annual_left","half_used","override_left","override_from","last_admin_update","notes"])
+        ws.append_row(row)
+
+    # 알림
+    try:
+        client.chat_postMessage(channel=body["user"]["id"], text=f"[잔여 기준선 설정] {uname}: {left_val}일, 기준일 {from_date}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
