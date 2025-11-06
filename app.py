@@ -82,40 +82,58 @@ def get_balance_row_map():
         if uk: pos[uk] = rn
     return ws, idx, rows, pos
 
-# --- 사용자에 대한 실질 잔여일수 계산 ---
+def to_float(s, default=0.0):
+    try: return float(str(s).strip())
+    except: return default
+
 def effective_left_for(user_key: str):
-    ws, idx, rows, pos = get_balance_row_map()
-    rn = pos.get((user_key or "").strip().lower())
-    if not rn: return None  # balances에 행이 없음
-    row = rows[rn-1]
-    def get(name, default=""):
-        i = idx.get(name); return (row[i] if i is not None and i < len(row) else default)
-    # 우선 override 기반
-    o_left = get("override_left","")
-    o_from = get("override_from","")
-    if o_left:
-        base = float(o_left)
-        since = parse_date(o_from) if DATE_RE.match(o_from or "") else None
-        used = logs_usage_since(user_key, since_date=since)
+    ws = sh.worksheet("balances")
+    vals = ws.get_all_values()
+    if not vals: return 0.0
+    head = [h.strip().lower() for h in vals[0]]
+    col = {h:i for i,h in enumerate(head)}
+    rn = None
+    for rnum, r in enumerate(vals[1:], start=2):
+        uk = (r[col.get("user_key",0)] if col.get("user_key",0) < len(r) else "").strip().lower()
+        if uk == (user_key or "").strip().lower():
+            row = r; rn = rnum; break
+    if not rn: return 0.0
+
+    o_left = row[col["override_left"]] if "override_left" in col and col["override_left"] < len(row) else ""
+    o_from = row[col["override_from"]] if "override_from" in col and col["override_from"] < len(row) else ""
+    if str(o_left).strip():
+        base = to_float(o_left, 0.0)
+        since = None
+        try:
+            y,m,d = map(int, str(o_from).split("-"))
+            since = dt.date(y,m,d)
+        except: pass
+        used = logs_usage_since(user_key, since_date=since)  # 기존 함수 사용
         return max(0.0, base - used)
-    # 없으면 기존 total-집계 방식(연도 기준)
-    total = float(get("annual_total","0") or 0)
-    # 올해 사용 합산
+
+    # fallback: 연간 계산
+    total = to_float(row[col.get("annual_total","")], 0.0)
     year = dt.datetime.now(KST).year
     used = 0.0
     ws_logs = sh.worksheet("logs")
-    vals = ws_logs.get_all_values()
-    head = [h.strip().lower() for h in vals[0]]
-    i_user = head.index("user_id") if "user_id" in head else head.index("user_key")
-    i_type = head.index("type"); i_date = head.index("date")
-    for r in vals[1:]:
-        uk = (r[i_user] if i_user < len(r) else "").strip()
-        if uk.lower() != (user_key or "").strip().lower(): continue
-        t = (r[i_type] if i_type < len(r) else "").strip().lower()
-        dd = parse_date((r[i_date] if i_date < len(r) else "").strip())
-        if not dd or dd.year != year: continue
-        used += 1.0 if t=="annual" else (0.5 if t=="halfday" else 0.0)
+    lvals = ws_logs.get_all_values()
+    if lvals:
+        lhead = [h.strip().lower() for h in lvals[0]]
+        iu = lhead.index("user_key") if "user_key" in lhead else lhead.index("user_id")
+        it = lhead.index("type"); idt = lhead.index("date")
+        for r in lvals[1:]:
+            if iu >= len(r) or it >= len(r) or idt >= len(r): continue
+            if (r[iu] or "").strip().lower() != (user_key or "").strip().lower(): continue
+            t = (r[it] or "").strip().lower()
+            try:
+                y,m,d = map(int, (r[idt] or "").split("-"))
+                dd = dt.date(y,m,d)
+            except:
+                continue
+            if dd.year != year: continue
+            used += 1.0 if t=="annual" else (0.5 if t=="halfday" else 0.0)
     return max(0.0, total - used)
+
 
 # --- 잔여일수 재정의 모달 뷰 빌더 ---
 def build_override_view(initial_left:str="", initial_date:str=""):
@@ -688,6 +706,48 @@ def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: st
         return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
     return None
 
+# --- balances 시트에 행 삽입 또는 업데이트 ---
+def upsert_balances_row(ukey, uname, *, override_left=None, override_from=None, note=""):
+    ws = sh.worksheet("balances")
+    vals = ws.get_all_values()
+    if not vals:
+        ws.append_row(["user_key","user_name","annual_total","annual_used","annual_left","half_used",
+                       "override_left","override_from","last_admin_update","notes"])
+        vals = ws.get_all_values()
+    head = [h.strip().lower() for h in vals[0]]
+    col = {h:i for i,h in enumerate(head)}  # 0-based
+    # 행 찾기
+    pos = None
+    for rnum, r in enumerate(vals[1:], start=2):
+        if (r[0] if r else "").strip().lower() == (ukey or "").strip().lower():
+            pos = rnum; break
+    # 행이 없으면 append
+    if pos is None:
+        ws.append_row([""]*10, value_input_option="USER_ENTERED")
+        pos = len(vals) + 1  # 새 행 번호
+
+    # 공통 필드
+    updates = []
+    def set_cell(name, value):
+        c = col.get(name); 
+        if c is not None:
+            rng = f"{chr(ord('A')+c)}{pos}:{chr(ord('A')+c)}{pos}"
+            updates.append((rng, [[value]]))
+
+    set_cell("user_key", ukey)
+    set_cell("user_name", uname)
+    if override_left is not None:
+        set_cell("override_left", str(override_left))
+    if override_from is not None:
+        set_cell("override_from", override_from)
+    set_cell("last_admin_update", dt.datetime.now(KST).isoformat(timespec="seconds"))
+    if note:
+        set_cell("notes", note)
+
+    # 일괄 업데이트
+    for rng, v in updates:
+        ws.update(range_name=rng, values=v, value_input_option="USER_ENTERED")
+
 
 # ---------- 이벤트 핸들러 등록 ----------
 @app.event("app_home_opened")
@@ -765,64 +825,67 @@ def on_action_change(ack, body, client):
 @app.view("attendance_submit")
 def 근태_submit(ack, body, view, client):
     vals = view["state"]["values"]
-    action = vals["action_b"]["action"]["selected_option"]["value"]  # "annual" | "halfday"
-    selected_date = vals.get("date_b", {}).get("date", {}).get("selected_date")  # YYYY-MM-DD or None
+    action = vals["action_b"]["action"]["selected_option"]["value"]  # annual|halfday|checkin|checkout
+    selected_date = (vals.get("date_b", {}).get("date", {}) or {}).get("selected_date")
     note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
-    user_id = body["user"]["id"]
-
-    # 검증
-    errors = {}
-    if action in ("annual", "halfday") and not selected_date:
-        errors["date_b"] = "날짜를 선택하세요."
 
     half_period = None
     if action == "halfday":
         hp = vals.get("half_b", {}).get("half_period", {}).get("selected_option")
         half_period = hp["value"] if hp else None
-        if half_period == "am": note = f"{note} (오전)"
-        if half_period == "pm": note = f"{note} (오후)"
 
+    # 사용자 키/이름
+    uid = body["user"]["id"]
+    ukey = safe_user_key(client, uid)
+    uname = safe_user_name(client, uid)
+
+    # 1) 필수값 검증
+    errors = {}
+    if action in ("annual","halfday") and not selected_date:
+        errors["date_b"] = "연차/반차는 날짜가 필요합니다."
+    if action == "halfday" and not half_period:
+        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
+
+    # 2) 중복 사전검증
+    if not errors:
+        dup = dup_error_msg_for(action, ukey, selected_date or today_kst_ymd(), half_period)
+        if dup:
+            # 블록 위치를 맞춰 에러 핀
+            if action == "annual":
+                errors["date_b"] = dup
+            elif action == "halfday":
+                # 오전/오후 중복이면 half_b, 그 외는 date_b
+                errors["half_b" if "반차" in dup else "date_b"] = dup
+            else:
+                errors["action_b"] = dup
+
+    # 3) 에러 있으면 폼 에러로 응답하고 종료
     if errors:
         ack(response_action="errors", errors=errors)
         return
 
-    # 통과
+    # 4) 통과 → ack 후 기록
     ack()
-    ukey = safe_user_key(client, body["user"]["id"])
-    uname = safe_user_name(client, body["user"]["id"])
-    guard_and_append(ukey, uname, action, note=note, date_str=(selected_date or ""), by_user=ukey, note_tag=half_period)
 
-    # 사용자명 조회(스코프 없으면 ID로 대체)
-    try:
-        info = client.users_info(user=user_id)
-        prof = info["user"]["profile"]
-        user_name = prof.get("display_name") or prof.get("real_name") or user_id
-    except Exception:
-        user_name = user_id
+    if action == "halfday":
+        if half_period == "am": note = f"{note} (오전)"
+        elif half_period == "pm": note = f"{note} (오후)"
 
-    # 로그 기록 규칙
-    # type: "annual" | "halfday"
-    # note: 반차면 "(오전)" 또는 "(오후)" 접미사 부여
     try:
-        guard_and_append(ukey, uname, action, note=note, date_str=(selected_date or ""), by_user=ukey)
+        guard_and_append(
+            ukey, uname, action,
+            note=note,
+            date_str=(selected_date or ""),
+            by_user=ukey,
+            note_tag=half_period
+        )
     except Exception as e:
-        # 모달 닫힌 후 오류 안내는 DM
+        # 예외는 DM로 알려줌. 뷰는 이미 닫힘.
         try:
-            client.chat_postMessage(channel=user_id, text=human_error(e))
+            client.chat_postMessage(channel=uid, text=human_error(e))
         except Exception:
             pass
 
-    # 에페메럴 알림
-    meta = json.loads(view.get("private_metadata") or "{}")
-    ch = meta.get("channel_id")
-    if ch:
-        if action == "annual":
-            txt = f"연차 {selected_date} 등록 완료"
-        elif action == "halfday":
-            txt = f"반차 {selected_date} 등록 완료"
-        else:
-            txt = "처리 완료"
-        client.chat_postEphemeral(channel=ch, user=user_id, text=txt)
         
 # --- 제출: admin_attendance_submit ---
 @app.view("admin_attendance_submit")
@@ -888,44 +951,22 @@ def admin_submit(ack, body, view, client):
         record_admin_request(admin_key, target_key, action, date_str or "", note, "fail", str(e))
         client.chat_postMessage(channel=admin_uid, text=f"[관리자 대리입력 실패] {human_error(e)}")
 
-# ---------- /잔여 및 /스케줄 커맨드 ----------
+# ---------- /잔여 커맨드 ----------
 @app.command("/잔여")
 def 잔여_cmd(ack, body, respond, client):
     ack()
-    uid = body["user_id"]
-    ukey = safe_user_key(client, uid)
-    row = None
-    eff = effective_left_for(ukey)
     try:
-        row = find_balance_row_for(ukey)
+        uid = body["user_id"]
+        ukey = safe_user_key(client, uid)          # 이메일 우선, 실패시 Slack ID
+        eff = effective_left_for(ukey)             # override_left/override_from 반영 계산
+        if eff is None:
+            respond("balances에 사용자 행이 없습니다. 관리자에게 문의하세요.")
+        else:
+            respond(f"현재 잔여: {eff:g}일")
     except Exception as e:
-        reply_error(respond, f"balances 시트 조회 실패: {e}")
-        return
+        respond(f"처리 중 오류: {e}")
 
-    if eff is None:
-        respond("balances에 사용자 행이 없습니다. 관리자에게 문의하세요.")
-        return
-
-    total = row.get("annual_total") or "0"
-    used  = row.get("annual_used")  or "0"
-    left  = row.get("annual_left")  or "0"
-    half  = row.get("half_used")    or "0"
-    uname = row.get("user_name")    or safe_user_name(client, uid)
-
-    blocks = [
-        {"type": "header", "text": {"type":"plain_text","text":"연차 잔여 요약"}},
-        {"type": "section","fields":[
-            {"type":"mrkdwn","text":f"*이름*\n{uname}"},
-            {"type":"mrkdwn","text":f"*식별자*\n{ukey}"},
-            {"type":"mrkdwn","text":f"*총 연차*\n{total}"},
-            {"type":"mrkdwn","text":f"*사용*\n{used}"},
-            {"type":"mrkdwn","text":f"*잔여*\n*{left}*"},
-            {"type":"mrkdwn","text":f"*반차 사용*\n{half}"},
-        ]},
-        {"type":"context","elements":[{"type":"mrkdwn","text":"balances 시트 기준"}]}
-    ]
-    respond(blocks=blocks, text="잔여 요약")
-
+# ---------- /스케줄 커맨드 ----------
 @app.command("/스케줄")
 def 스케줄_cmd(ack, body, respond, client):
     ack()
@@ -1013,6 +1054,27 @@ def 잔여갱신_submit(ack, body, view, client):
         client.chat_postMessage(channel=body["user"]["id"], text=f"[잔여 기준선 설정] {uname}: {left_val}일, 기준일 {from_date}")
     except Exception:
         pass
+
+@app.command("/잔여debug")
+def 잔여debug(ack, body, respond, client):
+    ack()
+    uid = body["user_id"]
+    ukey = safe_user_key(client, uid)
+    ws = sh.worksheet("balances")
+    vals = ws.get_all_values()
+    head = [h.strip().lower() for h in vals[0]] if vals else []
+    row = next((r for r in vals[1:] if (r[0] or "").strip().lower()==ukey.lower()), [])
+    resp = {
+        "ukey": ukey,
+        "override_left": (row[ head.index("override_left") ] if "override_left" in head and row else ""),
+        "override_from": (row[ head.index("override_from") ] if "override_from" in head and row else ""),
+        "annual_total":  (row[ head.index("annual_total") ] if "annual_total"  in head and row else ""),
+        "annual_used":   (row[ head.index("annual_used") ]  if "annual_used"   in head and row else ""),
+        "half_used":     (row[ head.index("half_used") ]    if "half_used"     in head and row else ""),
+        "effective_left": effective_left_for(ukey),
+    }
+    respond(f"```{resp}```")
+
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
