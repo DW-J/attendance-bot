@@ -29,6 +29,8 @@ ISO_WEEK_RE = re.compile(r"^\d{4}-W\d{2}$") # YYYY-Www
 DEDUP_WINDOW_SEC = 60          # 동일 사용자/타입/날짜 60초 내 중복 방지
 DAILY_UNIQUE = {"checkin","checkout"}  # 하루 1회만 허용하는 타입
 
+DOW_COLS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
 # 인플라이트 처리용 잠금 및 집합
 _inflight_lock = threading.Lock()
 _inflight = set()  # idempotency key 잠금
@@ -232,6 +234,70 @@ def date_to_iso_week_kst(date_str: str) -> str:
     day = dt.datetime(y, m, d, tzinfo=KST).date()
     Y, W, _ = day.isocalendar()
     return f"{Y}-W{W:02d}"
+
+
+
+def weekday_col_kst(date_str: str) -> str:
+    y, m, d = map(int, date_str.split("-"))
+    day = dt.datetime(y, m, d, tzinfo=KST).date()
+    return DOW_COLS[day.weekday()]  # Monday=0
+
+def upsert_weekly_schedule_checkin(user_key: str, date_str: str):
+    ws = get_ws("schedule_weekly")
+    vals = ws.get_all_values()
+    if not vals:
+        ws.append_row(
+            ["week","user_key","Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+            value_input_option="USER_ENTERED",
+        )
+        vals = ws.get_all_values()
+
+    header = [h.strip() for h in vals[0]]
+    # 소문자 맵으로 인덱스 관리
+    col = {h.lower(): i for i, h in enumerate(header)}
+
+    week = date_to_iso_week_kst(date_str)
+    dow = weekday_col_kst(date_str)  # "Mon".."Sun"
+    dow_idx = col.get(dow.lower())
+    week_idx = col.get("week")
+    user_idx = col.get("user_key")
+    if dow_idx is None or week_idx is None or user_idx is None:
+        return  # 헤더 틀리면 아무것도 안 함
+
+    key_norm = (user_key or "").strip().lower()
+    rownum = None
+    row = None
+
+    # (week, user_key) 행 찾기
+    for rn, r in enumerate(vals[1:], start=2):
+        w = (r[week_idx] if week_idx < len(r) else "").strip()
+        uk = (r[user_idx] if user_idx < len(r) else "").strip().lower()
+        if w == week and uk == key_norm:
+            rownum = rn
+            row = r
+            break
+
+    # 없으면 새 행
+    if rownum is None:
+        rownum = len(vals) + 1
+        row = [""] * len(header)
+        row[week_idx] = week
+        row[user_idx] = user_key
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        # append 후 최신값 다시 로드
+        vals = ws.get_all_values()
+        row = vals[rownum - 1]
+
+    # 해당 요일 셀이 비어있을 때만 '출근' 기록
+    cur = row[dow_idx] if dow_idx < len(row) else ""
+    if not str(cur).strip():
+        col_letter = chr(ord("A") + dow_idx)
+        ws.update(
+            range_name=f"{col_letter}{rownum}:{col_letter}{rownum}",
+            values=[["출근"]],
+            value_input_option="USER_ENTERED",
+        )
+
 
 # --- 사용자에 대한 사용 가능한 주차 목록 조회 ---
 def available_weeks_for_user(ukey: str):
@@ -901,11 +967,15 @@ def 출근_cmd(ack, body, respond, client):
     uid = body["user_id"]
     ukey = safe_user_key(client, uid)
     uname = safe_user_name(client, uid)
+    ds = today_kst_ymd()
     try:
-        guard_and_append(ukey, uname, "checkin", by_user=ukey)
+        guard_and_append(ukey, uname, "checkin", date_str=ds, by_user=ukey)
+        upsert_weekly_schedule_checkin(ukey, ds)
         respond(f"{uname} 출근 등록 완료")
     except Exception as e:
         respond(human_error(e))
+
+
 
 @app.command("/퇴근")
 def 퇴근_cmd(ack, body, respond, client):
