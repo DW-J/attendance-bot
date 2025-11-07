@@ -748,6 +748,142 @@ def upsert_balances_row(ukey, uname, *, override_left=None, override_from=None, 
     for rng, v in updates:
         ws.update(range_name=rng, values=v, value_input_option="USER_ENTERED")
 
+def parse_ymd_safe(s: str):
+    try:
+        y, m, d = map(int, s.split("-"))
+        return dt.date(y, m, d)
+    except Exception:
+        return None
+
+def calc_usage_from_logs(user_key: str, *, since: dt.date | None = None, year: int | None = None):
+    """logs에서 annual/halfday 사용량 합산."""
+    vals = logs.get_all_values()
+    if not vals:
+        return 0.0, 0.0
+
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    if iu is None or it is None or idate is None:
+        return 0.0, 0.0
+
+    target = (user_key or "").strip().lower()
+    annual_used = 0.0
+    half_used = 0.0
+
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+        uk = (r[iu] or "").strip().lower()
+        if uk != target:
+            continue
+
+        t = (r[it] or "").strip().lower()
+        d = parse_ymd_safe((r[idate] or "").strip())
+        if not d:
+            continue
+
+        if since and d < since:
+            continue
+        if year and d.year != year:
+            continue
+
+        if t == "annual":
+            annual_used += 1.0
+        elif t == "halfday":
+            half_used += 0.5
+
+    return annual_used, half_used
+
+def get_or_create_balance_row(ukey: str, uname: str):
+    ws = sh.worksheet("balances")
+    vals = ws.get_all_values()
+    if not vals:
+        ws.append_row(
+            ["user_key","user_name","annual_total","annual_used","annual_left",
+             "half_used","override_left","override_from","last_admin_update","notes"],
+            value_input_option="USER_ENTERED",
+        )
+        vals = ws.get_all_values()
+
+    head = [h.strip().lower() for h in vals[0]]
+    col = {h: i for i, h in enumerate(head)}
+
+    # 존재 행 탐색
+    rownum = None
+    for rn, r in enumerate(vals[1:], start=2):
+        key = (r[col["user_key"]] if col["user_key"] < len(r) else "").strip().lower()
+        if key == (ukey or "").strip().lower():
+            rownum = rn
+            row = r
+            break
+
+    if rownum is None:
+        rownum = len(vals) + 1
+        row = [""] * len(head)
+        # 신규 행 스켈레톤
+        row[col["user_key"]] = ukey
+        row[col["user_name"]] = uname
+        sh.worksheet("balances").append_row(row, value_input_option="USER_ENTERED")
+        vals = sh.worksheet("balances").get_all_values()
+        row = vals[rownum - 1]
+
+    return rownum, row, head, col
+
+def update_balance_for_user(ukey: str, uname: str):
+    ws = sh.worksheet("balances")
+    rownum, row, head, col = get_or_create_balance_row(ukey, uname)
+
+    def get(name, default=""):
+        i = col.get(name)
+        return (row[i] if i is not None and i < len(row) and row[i] != "" else default)
+
+    # 관리자 기준선이 있으면 우선 사용
+    o_left_raw = get("override_left", "")
+    o_from_raw = get("override_from", "")
+    now = dt.datetime.now(KST)
+
+    updates = {}
+
+    if str(o_left_raw).strip():
+        base = float(str(o_left_raw))
+        since = parse_ymd_safe(str(o_from_raw)) or None
+        au, hu = calc_usage_from_logs(ukey, since=since)
+        left = max(0.0, base - (au + hu))
+        updates["annual_used"] = f"{au:.1f}"
+        updates["half_used"] = f"{hu:.1f}"
+        updates["annual_left"] = f"{left:.1f}"
+    else:
+        # 기준선 없으면: annual_total을 신뢰하고, 올해 사용량으로 계산
+        year = now.year
+        total = float(str(get("annual_total", "0") or "0"))
+        au, hu = calc_usage_from_logs(ukey, year=year)
+        left = max(0.0, total - (au + hu))
+        updates["annual_used"] = f"{au:.1f}"
+        updates["half_used"] = f"{hu:.1f}"
+        updates["annual_left"] = f"{left:.1f}"
+
+    updates["user_key"] = ukey
+    updates["user_name"] = uname
+    updates["last_admin_update"] = now.isoformat(timespec="seconds")
+
+    # sheet 업데이트
+    for name, val in updates.items():
+        i = col.get(name)
+        if i is None:
+            continue
+        col_letter = chr(ord("A") + i)
+        ws.update(
+            range_name=f"{col_letter}{rownum}:{col_letter}{rownum}",
+            values=[[val]],
+            value_input_option="USER_ENTERED",
+        )
+
+    # 최종 잔여 리턴
+    return float(updates["annual_left"])
+
 
 # ---------- 이벤트 핸들러 등록 ----------
 @app.event("app_home_opened")
@@ -951,20 +1087,18 @@ def admin_submit(ack, body, view, client):
         record_admin_request(admin_key, target_key, action, date_str or "", note, "fail", str(e))
         client.chat_postMessage(channel=admin_uid, text=f"[관리자 대리입력 실패] {human_error(e)}")
 
-# ---------- /잔여 커맨드 ----------
 @app.command("/잔여")
 def 잔여_cmd(ack, body, respond, client):
     ack()
+    uid = body["user_id"]
+    ukey = safe_user_key(client, uid)
+    uname = safe_user_name(client, uid)
+
     try:
-        uid = body["user_id"]
-        ukey = safe_user_key(client, uid)          # 이메일 우선, 실패시 Slack ID
-        eff = effective_left_for(ukey)             # override_left/override_from 반영 계산
-        if eff is None:
-            respond("balances에 사용자 행이 없습니다. 관리자에게 문의하세요.")
-        else:
-            respond(f"현재 잔여: {eff:g}일")
+        left = update_balance_for_user(ukey, uname)
+        respond(f"현재 잔여: {left:g}일")
     except Exception as e:
-        respond(f"처리 중 오류: {e}")
+        respond(f"잔여 계산 오류: {e}")
 
 # ---------- /스케줄 커맨드 ----------
 @app.command("/스케줄")
