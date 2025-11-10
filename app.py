@@ -20,8 +20,6 @@ logs = sh.worksheet("logs")
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 KST = pytz.timezone("Asia/Seoul")
 
-ADMIN_ID_SET = {s.strip() for s in (os.getenv("ADMIN_IDS") or "").split(",") if s.strip()} # Slack 사용자 ID 화이트리스트
-ADMIN_EMAIL_SET = {e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()} # 이메일 화이트리스트
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$") # YYYY-MM-DD
 
@@ -32,22 +30,65 @@ DAILY_UNIQUE = {"checkin","checkout"}  # 하루 1회만 허용하는 타입
 
 DOW_COLS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
 
-# 인플라이트 처리용 잠금 및 집합
-_inflight_lock = threading.Lock()
-_inflight = set()  # idempotency key 잠금
+
 
 # 캐시
 user_cache = {}
 user_email_cache = {}
 
-# --- 날짜 문자열 파싱 ---
-def parse_date(s):
+ADMIN_ID_SET = {s.strip() for s in (os.getenv("ADMIN_IDS") or "").split(",") if s.strip()} # Slack 사용자 ID 화이트리스트
+ADMIN_EMAIL_SET = {e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()} # 이메일 화이트리스트
+
+# --- 관리자 여부 확인 ---
+def is_admin(user_id: str, client=None) -> bool:
+    # 1) ID 화이트리스트
+    if user_id in ADMIN_ID_SET:
+        return True
+    # 2) 이메일 화이트리스트
+    if ADMIN_EMAIL_SET:
+        try:
+            info = client.users_info(user=user_id)
+            email = (info["user"]["profile"].get("email") or "").lower()
+            if email in ADMIN_EMAIL_SET:
+                return True
+        except Exception:
+            pass
+    return False
+
+# --- 사용자 키/이름 ---
+# --- 사용자 키 안전 조회 ---
+def safe_user_key(client, slack_user_id: str) -> str:
+    """이메일 우선. 실패 시 Slack ID."""
     try:
-        y,m,d = map(int, s.split("-")); 
-        return dt.date(y,m,d)
-    except Exception: 
-        return None
+        info = client.users_info(user=slack_user_id)
+        return info["user"]["profile"].get("email") or slack_user_id
+    except Exception:
+        return slack_user_id
+
+# --- 사용자 이름 안전 조회 ---
+def safe_user_name(client, slack_user_id: str) -> str:
+    try:
+        info = client.users_info(user=slack_user_id)
+        p = info["user"]["profile"]
+        return p.get("display_name") or p.get("real_name") or slack_user_id
+    except Exception:
+        return slack_user_id
     
+# --- 시간/날짜 ------------------------------------------------------------
+
+# --- 오늘 KST 날짜 문자열 ---    
+def today_kst_ymd():
+    return dt.datetime.now(KST).date().isoformat()
+
+# --- YYYY-MM-DD 안전 파싱 ---
+def parse_ymd_safe(s: str):
+    try:
+        y, m, d = map(int, s.split("-"))
+        return dt.date(y, m, d)
+    except Exception:
+        return None
+
+# --- 시작일~종료일 날짜 문자열 반복기 ---
 def iter_dates(start_s: str, end_s: str):
     start = parse_ymd_safe(start_s)
     end = parse_ymd_safe(end_s)
@@ -63,30 +104,899 @@ def iter_dates(start_s: str, end_s: str):
         cur += one
     return out
 
-# --- 오늘 KST 날짜 문자열 ---    
-def today_kst_ymd():
-    return dt.datetime.now(KST).date().isoformat()
+# --- 날짜 문자열 파싱 ---
+def parse_date(s):
+    try:
+        y,m,d = map(int, s.split("-")); 
+        return dt.date(y,m,d)
+    except Exception: 
+        return None
 
-# --- 특정 사용자에 대한 특정 일자 이후 사용 일수 집계 ---    
-def logs_usage_since(user_key: str, since_date=None):
-    ws = sh.worksheet("logs")
+# --- 워크시트 가져오기 ---    
+def get_ws(name: str):
+    return sh.worksheet(name)
+
+# --- 지수적 백오프 재시도 ---
+def with_retry(fn, retries=5, base=0.2, max_sleep=2.0):
+    """
+    지수적 백오프 재시도. gspread 네트워크/429 방어.
+    """
+    last = None
+    for i in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            sleep = min(max_sleep, base * (2 ** i) + random.uniform(0, base))
+            time.sleep(sleep)
+    raise last
+
+# --- 예외를 사람이 읽을 수 있는 메시지로 변환 ---            
+def human_error(e: Exception) -> str:
+    s = str(e)
+    if "이미 오늘" in s or "이미 해당 날짜" in s:
+        return s
+    if "중복 처리 중" in s:
+        return s
+    us = s.upper()
+    if "PERMISSION" in us or "INSUFFICIENT" in us:
+        return "권한 오류. 시트 공유와 API 권한을 확인하세요."
+    if "RATE_LIMIT" in us or "429" in us:
+        return "요청이 많습니다. 잠시 후 다시 시도하세요."
+    return "처리 중 오류가 발생했습니다."
+
+# =========================================================
+# logs 기록 / 중복 체크
+# =========================================================
+
+# 인플라이트 처리용 잠금 및 집합
+_inflight_lock = threading.Lock()
+_inflight = set()  # idempotency key 잠금
+
+# --- 로그 기록 추가 ---    
+def append_log(user_key, user_name, type_, note="", date_str="", by_user=None):
+    ws = get_ws("logs")
+    now = dt.datetime.now(KST).isoformat(timespec="seconds")
+    row = [
+        now,
+        user_key,
+        user_name or "",
+        type_,
+        note or "",
+        date_str or "",
+        "auto",
+        by_user or user_key,
+    ]
+    with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+
+# --- 오늘 이미 기록했는지 검사 ---
+def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | None = None) -> bool:
+    ws = get_ws("logs")
     vals = ws.get_all_values()
-    if not vals: return 0.0
+    if not vals:
+        return False
+
     head = [h.strip().lower() for h in vals[0]]
-    i_user = head.index("user_id") if "user_id" in head else head.index("user_key")
-    i_type = head.index("type"); i_date = head.index("date")
-    used = 0.0
+    idx = {h: i for i, h in enumerate(head)}
+
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    inote = idx.get("note")
+
+    if iu is None or it is None or idate is None:
+        return False
+
+    uk = (user_key or "").strip().lower()
+    tp = type_.lower()
+    ds = (date_str or "").strip()
+
     for r in vals[1:]:
-        uk = (r[i_user] if i_user < len(r) else "").strip()
-        if uk.lower() != (user_key or "").strip().lower(): continue
-        t = (r[i_type] if i_type < len(r) else "").strip().lower()
-        d = (r[i_date] if i_date < len(r) else "").strip()
-        dd = parse_date(d)
-        if since_date and (not dd or dd < since_date):  # 기준일 전 기록은 제외
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
             continue
-        if t == "annual": used += 1.0
-        elif t == "halfday": used += 0.5
-    return used
+
+        uk2 = (r[iu] or "").strip().lower()
+        tp2 = (r[it] or "").strip().lower()
+        ds2 = (r[idate] or "").strip()
+
+        if uk2 != uk or tp2 != tp or ds2 != ds:
+            continue
+
+        # halfday 예외는 생략, 출퇴근에는 영향 없음
+        return True
+
+    return False
+
+
+# --- idempotency key 생성 ---
+def idemp_key(user_key: str, type_: str, date_str: str) -> str:
+    # date_str 없으면 오늘
+    return f"{(user_key or '').strip().lower()}|{type_.lower()}|{date_str}"
+
+# --- 중복 처리 방지 및 일일 1회 제한 적용 후 기록 추가 ---
+def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None):
+    ds = (date_str or today_kst_ymd()).strip()
+    key = idemp_key(user_key, type_, ds)
+
+    with _inflight_lock:
+        if key in _inflight:
+            raise RuntimeError("중복 처리 중입니다. 잠시 후 다시 시도하세요.")
+        _inflight.add(key)
+
+    try:
+        t = type_.lower()
+
+        if t in ("checkin", "checkout") and already_logged(user_key, t, ds, None):
+            raise RuntimeError(f"이미 오늘 {t} 기록이 있습니다.")
+
+        # (annual/halfday/off는 그대로)
+
+        def _do():
+            return append_log(user_key, user_name, t, note=note, date_str=ds, by_user=by_user)
+
+        return with_retry(_do)
+
+    finally:
+        with _inflight_lock:
+            _inflight.discard(key)
+            
+# --- 중복 기록 검사 및 메시지 생성 ---
+def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None) -> str | None:
+    """
+    폼 제출 단계에서 사전 중복 체크용.
+    guard_and_append와 동일 규칙을 사용해야 한다.
+    """
+    ds = (date_str or today_kst_ymd()).strip()
+    t = action.lower()
+
+    if t in {"checkin", "checkout"} and already_logged(user_key, t, ds, None):
+        return f"이미 오늘 {t} 기록이 있습니다."
+
+    if t == "annual" and already_logged(user_key, "annual", ds, None):
+        return "이미 해당 날짜에 연차 기록이 있습니다."
+
+    if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag=half_period):
+        tag_txt = "오전" if half_period == "am" else "오후"
+        return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
+
+    if t == "off" and already_logged(user_key, "off", ds, None):
+        return "이미 해당 날짜에 휴무 기록이 있습니다."
+
+    return None
+
+# =========================================================
+# 관리자 감사 로그
+# ========================================================= 
+
+# --- 관리자 요청 기록 ---
+def record_admin_request(admin_key, target_key, action, date_str, note, result, error_msg=""):
+    ws = get_ws("admin_requests")
+    vals = ws.get_all_values()
+    if not vals:
+        ws.append_row(
+            ["ts_iso","admin_key","target_key","action","date","note","result","error"],
+            value_input_option="USER_ENTERED",
+        )
+    now = dt.datetime.now(KST).isoformat(timespec="seconds")
+    row = [now, admin_key, target_key, action, date_str or "", note or "", result, error_msg or ""]
+    with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+
+# =========================================================
+# /근태 : 사용자 모달
+# =========================================================
+
+# ---------- 뷰 생성기 ----------
+def build_attendance_view(selected_action: str | None = None, preserved: dict | None = None):
+    action_options = [
+        {"text": {"type": "plain_text", "text": "연차"}, "value": "annual"},
+        {"text": {"type": "plain_text", "text": "반차"}, "value": "halfday"},
+        {"text": {"type": "plain_text", "text": "휴무"}, "value": "off"},
+    ]
+
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "action_b",
+            "dispatch_action": True,
+            "label": {"type": "plain_text", "text": "항목"},
+            "element": {
+                "type": "static_select",
+                "action_id": "action",
+                "placeholder": {"type": "plain_text", "text": "선택하세요"},
+                "options": action_options,
+                **(
+                    {"initial_option": next((o for o in action_options if o["value"] == selected_action), None)}
+                    if selected_action else {}
+                ),
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "date_start_b",
+            "label": {"type": "plain_text", "text": "시작일"},
+            "element": {"type": "datepicker", "action_id": "date_start"},
+        },
+        {
+            "type": "input",
+            "block_id": "date_end_b",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "종료일 (연차/휴무 기간용)"},
+            "element": {"type": "datepicker", "action_id": "date_end"},
+        },
+        {
+            "type": "input",
+            "block_id": "note_b",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "메모"},
+            "element": {"type": "plain_text_input", "action_id": "note"},
+        },
+    ]
+
+    if selected_action == "halfday":
+        blocks.insert(
+            3,
+            {
+                "type": "input",
+                "block_id": "half_b",
+                "label": {"type": "plain_text", "text": "반차 구분"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "half_period",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "오전(AM)"}, "value": "am"},
+                        {"text": {"type": "plain_text", "text": "오후(PM)"}, "value": "pm"},
+                    ],
+                },
+            },
+        )
+
+    return {
+        "type": "modal",
+        "callback_id": "attendance_submit",
+        "title": {"type": "plain_text", "text": "근태 등록"},
+        "submit": {"type": "plain_text", "text": "저장"},
+        "close": {"type": "plain_text", "text": "취소"},
+        "private_metadata": json.dumps(preserved or {}),
+        "blocks": blocks,
+    }
+    
+# ---------- /근태: 모달 열기 ----------
+@app.command("/근태")
+def 근태_modal(ack, body, client):
+    ack()
+    view = build_attendance_view(
+        selected_action=None,
+        preserved={"channel_id": body.get("channel_id")},
+    )
+    client.views_open(trigger_id=body["trigger_id"], view=view)   
+
+# ---------- 선택 변경 시: 모달 업데이트 ----------
+@app.block_action("action")
+def 근태_action_change(ack, body, client):
+    ack()
+    selected = body["actions"][0]["selected_option"]["value"]
+    meta = json.loads(body["view"].get("private_metadata") or "{}")
+    new_view = build_attendance_view(selected_action=selected, preserved=meta)
+    client.views_update(view_id=body["view"]["id"], view=new_view)
+    
+# ---------- 제출 처리 ----------
+@app.view("attendance_submit")
+def 근태_submit(ack, body, view, client, logger):
+    vals = (view.get("state") or {}).get("values") or {}
+    errors = {}
+
+    # ---------- 1) 액션 ----------
+    action = None
+    try:
+        sel = (vals.get("action_b", {}).get("action", {}) or {}).get("selected_option")
+        if sel:
+            action = sel.get("value")  # annual | halfday | off
+    except Exception:
+        pass
+
+    if not action:
+        errors["action_b"] = "항목을 선택하세요."
+
+    # ---------- 2) 날짜 ----------
+    def get_date(block_id, action_id):
+        try:
+            return (vals.get(block_id, {}).get(action_id, {}) or {}).get("selected_date")
+        except Exception:
+            return None
+
+    date_start = get_date("date_start_b", "date_start")
+    date_end = get_date("date_end_b", "date_end")
+
+    # ---------- 3) 메모 ----------
+    try:
+        note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
+    except Exception:
+        note = ""
+
+    # ---------- 4) 반차 구분 ----------
+    half_period = None
+    if action == "halfday":
+        try:
+            hp_sel = (vals.get("half_b", {}).get("half_period", {}) or {}).get("selected_option")
+            if hp_sel:
+                half_period = hp_sel.get("value")  # am / pm
+        except Exception:
+            pass
+
+    # ---------- 5) 유저 정보 ----------
+    uid = body["user"]["id"]
+    ukey = safe_user_key(client, uid)
+    uname = safe_user_name(client, uid)
+
+    # ---------- 6) 기본 검증 (여기서는 "형식"만, 시트 접근 금지) ----------
+    if action in ("annual", "halfday", "off") and not date_start:
+        errors["date_start_b"] = "시작일을 선택하세요."
+
+    if action in ("annual", "off") and date_start and date_end:
+        ds = parse_ymd_safe(date_start)
+        de = parse_ymd_safe(date_end)
+        if ds and de and de < ds:
+            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
+
+    if action == "halfday" and not half_period:
+        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
+
+    # ---------- 7) 형식 에러 있으면: 폼 에러로 ack 후 종료 ----------
+    if errors:
+        ack(response_action="errors", errors=errors)
+        return
+
+    # ---------- 8) 여기서 즉시 ack (시트 I/O 이전) ----------
+    ack()
+
+    # ---------- 9) 실제 기록 (이제 느린 작업 가능) ----------
+    try:
+        if action == "halfday":
+            ds = date_start
+            note_final = note
+            if half_period == "am":
+                note_final += " (오전)"
+            elif half_period == "pm":
+                note_final += " (오후)"
+            guard_and_append(
+                ukey,
+                uname,
+                "halfday",
+                note=note_final,
+                date_str=ds,
+                by_user=ukey,
+                note_tag=half_period,
+            )
+
+        elif action in ("annual", "off"):
+            if not date_end:
+                date_end = date_start
+            for ds in iter_dates(date_start, date_end):
+                guard_and_append(
+                    ukey,
+                    uname,
+                    action,          # "annual" or "off"
+                    note=note,
+                    date_str=ds,
+                    by_user=ukey,
+                )
+
+        else:
+            # action을 checkin/checkout으로 확장할 경우용
+            ds = date_start or today_kst_ymd()
+            guard_and_append(
+                ukey,
+                uname,
+                action,
+                note=note,
+                date_str=ds,
+                by_user=ukey,
+            )
+
+    except Exception as e:
+        # 중복/기타 오류: 모달은 이미 닫혔으므로 에페메럴/DM로만 안내
+        logger.exception("attendance_submit processing error")
+        msg = human_error(e)
+        try:
+            meta = json.loads(view.get("private_metadata") or "{}")
+            ch = meta.get("channel_id") or uid
+            client.chat_postEphemeral(channel=ch, user=uid, text=msg)
+        except Exception:
+            # 에페메럴 실패 시 DM 시도
+            try:
+                client.chat_postMessage(channel=uid, text=msg)
+            except Exception:
+                pass
+        return
+
+    # ---------- 10) 성공 에페메럴 안내 ----------
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        ch = meta.get("channel_id") or uid
+
+        if action == "halfday":
+            label = "반차"
+            if half_period == "am":
+                label = "오전 반차"
+            elif half_period == "pm":
+                label = "오후 반차"
+            client.chat_postEphemeral(
+                channel=ch,
+                user=uid,
+                text=f"{label} {date_start} 등록 완료",
+            )
+
+        elif action == "annual":
+            if date_end and date_end != date_start:
+                txt = f"연차 {date_start} ~ {date_end} 등록 완료"
+            else:
+                txt = f"연차 {date_start} 등록 완료"
+            client.chat_postEphemeral(channel=ch, user=uid, text=txt)
+
+        elif action == "off":
+            if date_end and date_end != date_start:
+                txt = f"휴무 {date_start} ~ {date_end} 등록 완료"
+            else:
+                txt = f"휴무 {date_start} 등록 완료"
+            client.chat_postEphemeral(channel=ch, user=uid, text=txt)
+    except Exception:
+        pass
+
+
+# =========================================================
+# /근태관리 : 관리자 대리입력 모달
+# =========================================================
+
+# --- 모달 뷰 빌더(관리자용) ---
+def build_admin_view(selected_action: str | None = None, preserved: dict | None = None):
+    action_options = [
+        {"text": {"type": "plain_text", "text": "출근"}, "value": "checkin"},
+        {"text": {"type": "plain_text", "text": "퇴근"}, "value": "checkout"},
+        {"text": {"type": "plain_text", "text": "연차"}, "value": "annual"},
+        {"text": {"type": "plain_text", "text": "반차"}, "value": "halfday"},
+        {"text": {"type": "plain_text", "text": "휴무"}, "value": "off"},
+    ]
+
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "target_b",
+            "label": {"type": "plain_text", "text": "대상자"},
+            "element": {"type": "users_select", "action_id": "target"},
+        },
+        {
+            "type": "input",
+            "block_id": "action_b",
+            "dispatch_action": True,
+            "label": {"type": "plain_text", "text": "항목"},
+            "element": {
+                "type": "static_select",
+                "action_id": "action",
+                "placeholder": {"type": "plain_text", "text": "선택하세요"},
+                "options": action_options,
+                **(
+                    {"initial_option": next((o for o in action_options if o["value"] == selected_action), None)}
+                    if selected_action else {}
+                ),
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "date_start_b",
+            "label": {"type": "plain_text", "text": "시작일"},
+            "element": {"type": "datepicker", "action_id": "date_start"},
+        },
+        {
+            "type": "input",
+            "block_id": "date_end_b",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "종료일 (연차/휴무/기간 처리용)"},
+            "element": {"type": "datepicker", "action_id": "date_end"},
+        },
+        {
+            "type": "input",
+            "block_id": "note_b",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "메모"},
+            "element": {"type": "plain_text_input", "action_id": "note"},
+        },
+    ]
+
+    if selected_action == "halfday":
+        blocks.insert(
+            3,
+            {
+                "type": "input",
+                "block_id": "half_b",
+                "label": {"type": "plain_text", "text": "반차 구분"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "half_period",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "오전(AM)"}, "value": "am"},
+                        {"text": {"type": "plain_text", "text": "오후(PM)"}, "value": "pm"},
+                    ],
+                },
+            },
+        )
+
+    return {
+        "type": "modal",
+        "callback_id": "admin_attendance_submit",
+        "title": {"type": "plain_text", "text": "관리자 근태 입력"},
+        "submit": {"type": "plain_text", "text": "저장"},
+        "close": {"type": "plain_text", "text": "취소"},
+        "private_metadata": json.dumps(preserved or {}),
+        "blocks": blocks,
+    }
+
+# --- 커맨드: /근태관리 ---
+# 호출부
+@app.command("/근태관리")
+def admin_modal(ack, body, client, respond):
+    ack()
+    uid = body["user_id"]
+    if not is_admin(uid, client):
+        respond("권한 없음.")
+        return
+    view = build_admin_view(selected_action=None, preserved={})
+    client.views_open(trigger_id=body["trigger_id"], view=view)
+    
+@app.block_action("action")
+def admin_action_change(ack, body, client):
+    # /근태와 /근태관리 둘 다 이 핸들러를 쓰므로 callback_id로 분기
+    ack()
+    selected = body["actions"][0]["selected_option"]["value"]
+    view = body["view"]
+    meta = json.loads(view.get("private_metadata") or "{}")
+    if view.get("callback_id") == "admin_attendance_submit":
+        new_view = build_admin_view(selected_action=selected, preserved=meta)
+    else:
+        new_view = build_attendance_view(selected_action=selected, preserved=meta)
+    client.views_update(view_id=view["id"], view=new_view)
+    
+# --- 제출: admin_attendance_submit ---
+@app.view("admin_attendance_submit")
+def admin_submit(ack, body, view, client):
+    vals = view["state"]["values"]
+
+    target_uid = vals["target_b"]["target"]["selected_user"]
+    action = vals["action_b"]["action"]["selected_option"]["value"]  # checkin|checkout|annual|halfday|off
+
+    date_start = vals["date_start_b"]["date_start"].get("selected_date")
+    date_end = vals.get("date_end_b", {}).get("date_end", {}).get("selected_date")
+    note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
+
+    half_period = None
+    if action == "halfday" and "half_b" in vals:
+        hp = vals["half_b"]["half_period"].get("selected_option")
+        half_period = hp["value"] if hp else None
+
+    admin_uid = body["user"]["id"]
+    admin_key = safe_user_key(client, admin_uid)
+    target_key = safe_user_key(client, target_uid)
+    target_name = safe_user_name(client, target_uid)
+
+    errors = {}
+
+    # 권한 검증
+    if not is_admin(admin_uid, client):
+        errors["action_b"] = "관리자 권한이 없습니다."
+
+    # 필수 검증
+    if action in ("annual", "halfday", "off") and not date_start:
+        errors["date_start_b"] = "시작일을 선택하세요."
+
+    if action in ("annual", "off") and date_start and date_end:
+        if parse_ymd_safe(date_end) and parse_ymd_safe(date_start) and parse_ymd_safe(date_end) < parse_ymd_safe(date_start):
+            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
+
+    if action == "halfday" and not half_period:
+        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
+
+    # 중복 사전검증
+    if not errors and date_start:
+        if action in ("annual", "off") and date_end:
+            dates = iter_dates(date_start, date_end)
+        else:
+            dates = [date_start]
+
+        for ds in dates:
+            dup = dup_error_msg_for(action, target_key, ds, half_period)
+            if dup:
+                if action in ("annual", "off"):
+                    errors["date_start_b"] = dup
+                elif action == "halfday":
+                    key = "half_b" if "반차" in dup or "오전" in dup or "오후" in dup else "date_start_b"
+                    errors[key] = dup
+                else:
+                    errors["action_b"] = dup
+                break
+
+    if errors:
+        ack(response_action="errors", errors=errors)
+        try:
+            record_admin_request(admin_key, target_key, action, date_start or "", note, "fail", "; ".join(errors.values()))
+        except Exception:
+            pass
+        return
+
+    ack()
+
+    # 실제 기록
+    try:
+        if action == "halfday":
+            ds = date_start
+            note_final = note
+            if half_period == "am":
+                note_final += " (오전)"
+            elif half_period == "pm":
+                note_final += " (오후)"
+            guard_and_append(target_key, target_name, "halfday",
+                             note=note_final, date_str=ds,
+                             by_user=admin_key, note_tag=half_period)
+            record_admin_request(admin_key, target_key, "halfday", ds, note_final, "ok", "")
+        elif action in ("annual", "off"):
+            if not date_end:
+                date_end = date_start
+            for ds in iter_dates(date_start, date_end):
+                guard_and_append(target_key, target_name, action,
+                                 note=note, date_str=ds, by_user=admin_key)
+            record_admin_request(admin_key, target_key, action,
+                                 f"{date_start}~{date_end}" if date_end != date_start else date_start,
+                                 note, "ok", "")
+        else:  # checkin / checkout
+            ds = date_start or today_kst_ymd()
+            guard_and_append(target_key, target_name, action,
+                             note=note, date_str=ds, by_user=admin_key)
+            record_admin_request(admin_key, target_key, action, ds, note, "ok", "")
+        # 관리자에게 결과 안내
+        client.chat_postMessage(
+            channel=admin_uid,
+            text=f"[관리자 대리입력] {target_name} {action} 처리 완료",
+        )
+    except Exception as e:
+        record_admin_request(admin_key, target_key, action, date_start or "", note, "fail", str(e))
+        client.chat_postMessage(
+            channel=admin_uid,
+            text=f"[관리자 대리입력 실패] {human_error(e)}",
+        )
+
+# =========================================================
+# balances / 잔여 계산 유틸
+# ---------------------------------------------------------
+# 시트 스키마 (balances):
+# A:user_key  B:user_name  C:annual_total  D:annual_used
+# E:annual_left  F:half_used  G:override_left
+# H:override_from  I:last_admin_update  J:notes
+# =========================================================
+
+# --- 안전한 실수 변환 ---
+def to_float(v, default=0.0):
+    try:
+        s = str(v).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def logs_usage_since(user_key: str, since_date: dt.date | None = None, year: int | None = None):
+    """
+    logs에서 해당 사용자 연차/반차 사용량 집계.
+    annual: 1.0, halfday: 0.5
+    since_date가 있으면 그 날짜 이상만.
+    year가 있으면 해당 연도만.
+    둘 다 주어지면 AND 조건.
+    """
+    ws = get_ws("logs")
+    vals = ws.get_all_values()
+    if not vals:
+        return 0.0, 0.0
+
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+
+    if iu is None or it is None or idate is None:
+        return 0.0, 0.0
+
+    target = (user_key or "").strip().lower()
+    annual_used = 0.0
+    half_used = 0.0
+
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+
+        uk = (r[iu] or "").strip().lower()
+        if uk != target:
+            continue
+
+        t = (r[it] or "").strip().lower()
+        d = parse_ymd_safe((r[idate] or "").strip())
+        if not d:
+            continue
+
+        if since_date and d < since_date:
+            continue
+        if year and d.year != year:
+            continue
+
+        if t == "annual":
+            annual_used += 1.0
+        elif t == "halfday":
+            half_used += 0.5
+
+    return annual_used, half_used
+
+def get_or_create_balance_row(ukey: str, uname: str):
+    """
+    balances에서 user_key 행을 찾고 없으면 생성.
+    (rownum, row_values, head_list, col_index_map) 반환.
+    """
+    ws = get_ws("balances")
+    vals = ws.get_all_values()
+
+    # 헤더 없으면 생성
+    if not vals:
+        ws.append_row(
+            ["user_key","user_name","annual_total","annual_used","annual_left",
+             "half_used","override_left","override_from","last_admin_update","notes"],
+            value_input_option="USER_ENTERED",
+        )
+        vals = ws.get_all_values()
+
+    head = [h.strip().lower() for h in vals[0]]
+    col = {h: i for i, h in enumerate(head)}
+
+    # 필수 컬럼 없으면 그대로 둔다 (호출 전에 시트 맞춰둘 것)
+    if "user_key" not in col or "user_name" not in col:
+        raise RuntimeError("balances 시트 헤더(user_key,user_name)가 올바르지 않습니다.")
+
+    target = (ukey or "").strip().lower()
+    rownum = None
+    row = None
+
+    for rn, r in enumerate(vals[1:], start=2):
+        key = (r[col["user_key"]] if col["user_key"] < len(r) else "").strip().lower()
+        if key == target:
+            rownum = rn
+            row = r
+            break
+
+    if rownum is None:
+        # 새 행 스켈레톤
+        rownum = len(vals) + 1
+        new_row = [""] * len(head)
+        new_row[col["user_key"]] = ukey
+        new_row[col["user_name"]] = uname
+        ws.append_row(new_row, value_input_option="USER_ENTERED")
+        vals = ws.get_all_values()
+        row = vals[rownum - 1]
+
+    return ws, rownum, row, head, col
+
+
+def update_balance_for_user(ukey: str, uname: str) -> float:
+    """
+    1) balances에 해당 user_key 행 생성 또는 로드
+    2) override_left가 있으면:
+         override_from 이후 logs 사용량만 차감
+       없으면:
+         annual_total 기준, 해당 연도 logs 사용량 차감
+    3) annual_used, half_used, annual_left, last_admin_update 업데이트
+    4) 최종 잔여일수 반환
+    """
+    ws, rownum, row, head, col = get_or_create_balance_row(ukey, uname)
+
+    def get_cell(name: str, default: str = ""):
+        i = col.get(name)
+        if i is None:
+            return default
+        return (row[i] if i < len(row) and row[i] != "" else default)
+
+    now = dt.datetime.now(KST)
+    now_iso = now.isoformat(timespec="seconds")
+
+    # 관리자 기준선 우선
+    o_left_raw = get_cell("override_left", "")
+    o_from_raw = get_cell("override_from", "")
+
+    updates = {
+        "user_key": ukey,
+        "user_name": uname,
+        "last_admin_update": now_iso,
+    }
+
+    if str(o_left_raw).strip() != "":
+        base = to_float(o_left_raw, 0.0)
+        since = parse_ymd_safe(str(o_from_raw)) if o_from_raw else None
+        au, hu = logs_usage_since(ukey, since_date=since)
+        left = max(0.0, base - (au + hu))
+        updates["annual_used"] = f"{au:.1f}"
+        updates["half_used"] = f"{hu:.1f}"
+        updates["annual_left"] = f"{left:.1f}"
+        eff_left = left
+    else:
+        # annual_total 기반
+        total = to_float(get_cell("annual_total", "0"), 0.0)
+        year = now.year
+        au, hu = logs_usage_since(ukey, year=year)
+        left = max(0.0, total - (au + hu))
+        updates["annual_used"] = f"{au:.1f}"
+        updates["half_used"] = f"{hu:.1f}"
+        updates["annual_left"] = f"{left:.1f}"
+        eff_left = left
+        
+    
+    # 시트 업데이트 (필요 컬럼만)
+    def cell_range(col_index: int) -> str:
+        # 0-based index -> A,B,C...
+        return f"{chr(ord('A') + col_index)}{rownum}:{chr(ord('A') + col_index)}{rownum}"
+
+    def do_updates():
+        data = []
+        for name, val in updates.items():
+            i = col.get(name)
+            if i is None:
+                continue
+            data.append({
+                "range": cell_range(i),
+                "values": [[val]],
+            })
+        if data:
+            ws.batch_update(data, value_input_option="USER_ENTERED")
+
+    with_retry(do_updates)
+
+    return eff_left
+
+# =========================================================
+# /잔여 : 사용자 잔여 조회 + balances 동기화
+# =========================================================
+
+# ---------- /잔여 커맨드 ----------
+@app.command("/잔여")
+def 잔여_cmd(ack, body, respond, client):
+    ack()
+    try:
+        uid = body["user_id"]
+        ukey = safe_user_key(client, uid)
+        uname = safe_user_name(client, uid)
+
+        left = update_balance_for_user(ukey, uname)
+
+        # override 기반인지, total 기반인지 간단 표시 (선택)
+        ws = get_ws("balances")
+        vals = ws.get_all_values()
+        head = [h.strip().lower() for h in vals[0]] if vals else []
+        col = {h: i for i, h in enumerate(head)}
+        row = None
+        for rn, r in enumerate(vals[1:], start=2):
+            if col.get("user_key", 0) < len(r) and (r[col["user_key"]] or "").strip().lower() == ukey.lower():
+                row = r
+                break
+
+        detail = ""
+        if row and "override_left" in col:
+            o = (row[col["override_left"]] if col["override_left"] < len(row) else "").strip()
+            if o != "":
+                detail = f"(관리자 기준선 {o}일 기준)"
+        if not detail and row and "annual_total" in col:
+            t = (row[col["annual_total"]] if col["annual_total"] < len(row) else "").strip()
+            if t != "":
+                detail = f"(연차 총 {t}일 기준)"
+
+        if detail:
+            respond(f"현재 잔여: {left:g}일 {detail}")
+        else:
+            respond(f"현재 잔여: {left:g}일")
+    except Exception as e:
+        respond(f"잔여 계산 오류: {human_error(e)}")
 
 # --- 잔여일수 행 맵 조회 ---
 def get_balance_row_map():
@@ -102,10 +1012,7 @@ def get_balance_row_map():
         if uk: pos[uk] = rn
     return ws, idx, rows, pos
 
-def to_float(s, default=0.0):
-    try: return float(str(s).strip())
-    except: return default
-
+# --- 특정 사용자 잔여일수 계산 ---
 def effective_left_for(user_key: str):
     ws = sh.worksheet("balances")
     vals = ws.get_all_values()
@@ -253,13 +1160,13 @@ def date_to_iso_week_kst(date_str: str) -> str:
     Y, W, _ = day.isocalendar()
     return f"{Y}-W{W:02d}"
 
-
-
+# --- 날짜 문자열을 KST 요일 컬럼명으로 변환 ---
 def weekday_col_kst(date_str: str) -> str:
     y, m, d = map(int, date_str.split("-"))
     day = dt.datetime(y, m, d, tzinfo=KST).date()
     return DOW_COLS[day.weekday()]  # Monday=0
 
+# --- 주간 스케줄에 출근 기록 업서트 ---
 def upsert_weekly_schedule_checkin(user_key: str, date_str: str):
     ws = get_ws("schedule_weekly")
     vals = ws.get_all_values()
@@ -394,25 +1301,6 @@ def find_schedule_for(week: str, user_key: str):
             return r
     return None
 
-# --- 사용자 키 안전 조회 ---
-def safe_user_key(client, slack_user_id: str) -> str:
-    """이메일 우선. 실패 시 Slack ID."""
-    try:
-        info = client.users_info(user=slack_user_id)
-        email = info["user"]["profile"].get("email")
-        return email or slack_user_id
-    except Exception:
-        return slack_user_id
-
-# --- 사용자 이름 안전 조회 ---
-def safe_user_name(client, slack_user_id: str) -> str:
-    try:
-        info = client.users_info(user=slack_user_id)
-        p = info["user"]["profile"]
-        return p.get("display_name") or p.get("real_name") or slack_user_id
-    except Exception:
-        return slack_user_id
-
 # --- 오류 응답 안전 처리 ---
 def reply_error(respond, msg="오류가 발생했습니다. 잠시 후 다시 시도하세요."):
     try:
@@ -437,62 +1325,6 @@ def resolve_user_email(client, user_id: str) -> str | None:
     except Exception:
         return None
 
-# --- 로그 기록 추가 ---    
-def append_log(user_key, user_name, type_, note="", date_str="", by_user=None):
-    # user_key, by_user에는 이제 이메일 또는 ID가 들어옴
-    now = dt.datetime.now(KST).isoformat(timespec="seconds")
-    row = [now, user_key, user_name or "", type_, note, date_str, "auto", by_user or user_key]
-    logs.append_rows([row], value_input_option="USER_ENTERED", table_range="A1:H1")
-
-# --- 관리자 여부 확인 ---
-def is_admin(user_id: str, client=None) -> bool:
-    # 1) ID 화이트리스트
-    if user_id in ADMIN_ID_SET:
-        return True
-    # 2) 이메일 화이트리스트
-    if client and ADMIN_EMAIL_SET:
-        try:
-            info = client.users_info(user=user_id)
-            email = (info["user"]["profile"].get("email") or "").lower()
-            return email in ADMIN_EMAIL_SET
-        except Exception:
-            return False
-    return False
-
-# --- idempotency key 생성 ---
-def idemp_key(user_key: str, type_: str, date_str: str) -> str:
-    # date_str 없으면 오늘
-    return f"{(user_key or '').strip().lower()}|{type_.lower()}|{date_str}"
-
-# --- 지수적 백오프 재시도 ---
-def with_retry(fn, retries=5, base=0.2, max_sleep=2.0):
-    """
-    지수적 백오프 재시도. gspread 네트워크/429 방어.
-    """
-    last = None
-    for i in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            sleep = min(max_sleep, base * (2 ** i) + random.uniform(0, base))
-            time.sleep(sleep)
-    raise last
-
-# --- 관리자 요청 기록 ---
-def record_admin_request(admin_key, target_key, action, date_str, note, result, error_msg=""):
-    ws = get_ws("admin_requests")
-    vals = ws.get_all_values()
-    if not vals:
-        ws.append_row(
-            ["ts_iso","admin_key","target_key","action","date","note","result","error"],
-            value_input_option="USER_ENTERED",
-        )
-    now = dt.datetime.now(KST).isoformat(timespec="seconds")
-    row = [now, admin_key, target_key, action, date_str or "", note or "", result, error_msg or ""]
-    with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
-
-
 # ---------- 에러 핸들러 데코레이터 : 슬래시 커맨드에서 예외 발생 시 통일 메시지. ----------
 def slash_guard(fn):
     def _w(ack, body, respond, *args, **kwargs):
@@ -501,152 +1333,6 @@ def slash_guard(fn):
         except Exception as e:
             reply_error(respond, f"처리 중 오류: {e}")
     return _w
-
-
-# ---------- 뷰 생성기 ----------
-def build_attendance_view(selected_action: str | None = None, preserved: dict | None = None):
-    action_options = [
-        {"text": {"type": "plain_text", "text": "연차"},  "value": "annual"},
-        {"text": {"type": "plain_text", "text": "반차"},  "value": "halfday"},
-        {"text": {"type": "plain_text", "text": "휴무"},  "value": "off"},
-    ]
-
-    blocks = [
-        {
-            "type": "input",
-            "block_id": "action_b",
-            "dispatch_action": True,  # 선택 시 block_action 발생
-            "label": {"type": "plain_text", "text": "항목"},
-            "element": {
-                "type": "static_select",
-                "action_id": "action",
-                "placeholder": {"type": "plain_text", "text": "선택하세요"},
-                "options": action_options,
-                **(
-                    {"initial_option":
-                        next((o for o in action_options if o["value"] == selected_action), None)
-                      } if selected_action else {}
-                )
-            },
-        },
-        {
-            "type": "input",
-            "block_id": "date_start_b",
-            "label": {"type": "plain_text", "text": "시작일"},
-            "element": {"type": "datepicker", "action_id": "date_start"},
-        },
-        {
-            "type": "input",
-            "block_id": "date_end_b",
-            "optional": True,
-            "label": {"type": "plain_text", "text": "종료일 (연차/휴무 기간용, 미선택 시 시작일과 동일)"},
-            "element": {"type": "datepicker", "action_id": "date_end"},
-        },
-        {
-            "type": "input",
-            "block_id": "note_b",
-            "optional": True,
-            "label": {"type": "plain_text", "text": "메모"},
-            "element": {"type": "plain_text_input", "action_id": "note"},
-        },
-    ]
-
-    # 반차일 때만 오전/오후 선택 추가
-    if selected_action == "halfday":
-        blocks.insert(
-            3,
-            {
-                "type": "input",
-                "block_id": "half_b",
-                "label": {"type": "plain_text", "text": "반차 구분"},
-                "element": {
-                    "type": "radio_buttons",
-                    "action_id": "half_period",
-                    "options": [
-                        {
-                            "text": {"type": "plain_text", "text": "오전(AM)"},
-                            "value": "am",
-                        },
-                        {
-                            "text": {"type": "plain_text", "text": "오후(PM)"},
-                            "value": "pm",
-                        },
-                    ],
-                },
-            },
-        )
-
-    return {
-        "type": "modal",
-        "callback_id": "attendance_submit",
-        "title": {"type": "plain_text", "text": "근태 등록"},
-        "submit": {"type": "plain_text", "text": "저장"},
-        "close": {"type": "plain_text", "text": "취소"},
-        "private_metadata": json.dumps(preserved or {}),
-        "blocks": blocks,
-    }
-    
-# --- 모달 뷰 빌더(관리자용) ---
-def build_admin_view():
-    return {
-        "type": "modal",
-        "callback_id": "admin_attendance_submit",
-        "title": {"type": "plain_text", "text": "관리자 근태 입력"},
-        "submit": {"type": "plain_text", "text": "저장"},
-        "close": {"type": "plain_text", "text": "취소"},
-        "blocks": [
-            {   # 대상자 선택
-                "type": "input",
-                "block_id": "target_b",
-                "label": {"type": "plain_text", "text": "대상자"},
-                "element": {"type": "users_select", "action_id": "target"}
-            },
-            {   # 항목
-                "type": "input",
-                "block_id": "action_b",
-                "label": {"type": "plain_text", "text": "항목"},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "action",
-                    "placeholder": {"type": "plain_text", "text": "선택"},
-                    "options": [
-                        {"text": {"type": "plain_text", "text": "출근"},   "value": "checkin"},
-                        {"text": {"type": "plain_text", "text": "퇴근"},   "value": "checkout"},
-                        {"text": {"type": "plain_text", "text": "연차"},   "value": "annual"},
-                        {"text": {"type": "plain_text", "text": "반차"},   "value": "halfday"},
-                    ]
-                }
-            },
-            {   # 반차 구분(선택사항)
-                "type": "input",
-                "block_id": "half_b",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "반차 구분"},
-                "element": {
-                    "type": "radio_buttons",
-                    "action_id": "half_period",
-                    "options": [
-                        {"text": {"type": "plain_text", "text": "오전(AM)"}, "value": "am"},
-                        {"text": {"type": "plain_text", "text": "오후(PM)"}, "value": "pm"},
-                    ],
-                },
-            },
-            {   # 일자
-                "type": "input",
-                "block_id": "date_b",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "날짜(연차/반차 필수)"},
-                "element": {"type": "datepicker", "action_id": "date"}
-            },
-            {   # 메모
-                "type": "input",
-                "block_id": "note_b",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "메모"},
-                "element": {"type": "plain_text_input", "action_id": "note"}
-            },
-        ]
-    }
 
 # --- 문자열 표시폭 계산 ---  
 def disp_width(s: str) -> int:
@@ -680,108 +1366,6 @@ def render_week_table(week: str, r: dict) -> str:
 
     return f"*{week} 주간 스케줄*\n```{header}\n{values}```"
 
-# --- 오늘 이미 기록했는지 검사 ---
-def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | None = None) -> bool:
-    vals = logs.get_all_values()
-    if not vals:
-        return False
-
-    head = [h.strip().lower() for h in vals[0]]
-    idx = {h: i for i, h in enumerate(head)}
-    iu = idx.get("user_key") or idx.get("user_id")
-    it = idx.get("type")
-    idate = idx.get("date")
-    inote = idx.get("note")
-
-    if iu is None or it is None or idate is None:
-        return False
-
-    uk = (user_key or "").strip().lower()
-    tp = type_.lower()
-    ds = date_str.strip()
-
-    for r in vals[1:]:
-        if iu >= len(r) or it >= len(r) or idate >= len(r):
-            continue
-        if (r[iu] or "").strip().lower() != uk:
-            continue
-        if (r[it] or "").strip().lower() != tp:
-            continue
-        if (r[idate] or "").strip() != ds:
-            continue
-
-        # halfday: 오전/오후까지 동일해야 중복
-        if tp == "halfday" and note_tag:
-            if inote is None or inote >= len(r):
-                continue
-            note = r[inote] or ""
-            if note_tag == "am" and "(오전)" in note:
-                return True
-            if note_tag == "pm" and "(오후)" in note:
-                return True
-            continue
-
-        # 나머지는 같은 날 같은 타입이면 중복
-        return True
-
-    return False
-
-# --- 중복 처리 방지 및 일일 1회 제한 적용 후 기록 추가 ---
-def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None):
-    ds = (date_str or today_kst_ymd()).strip()
-    key = idemp_key(user_key, type_, ds)
-
-    # 인플라이트 잠금
-    with _inflight_lock:
-        if key in _inflight:
-            raise RuntimeError("중복 처리 중입니다. 잠시 후 다시 시도하세요.")
-        _inflight.add(key)
-
-    try:
-        t = type_.lower()
-
-        # 출근/퇴근: 하루 1회
-        if t in ("checkin", "checkout") and already_logged(user_key, t, ds, None):
-            raise RuntimeError(f"이미 오늘 {t} 기록이 있습니다.")
-
-        # 연차: 해당 날짜 1회
-        if t == "annual" and already_logged(user_key, "annual", ds, None):
-            raise RuntimeError("이미 해당 날짜에 연차 기록이 있습니다.")
-
-        # 반차: 해당 날짜, 동일 구분(am/pm) 1회
-        if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag):
-            tag_txt = "오전" if note_tag == "am" else "오후"
-            raise RuntimeError(f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다.")
-
-        # 휴무(off): 같은 날짜 중복 방지
-        if t == "off" and already_logged(user_key, "off", ds, None):
-            raise RuntimeError("이미 해당 날짜에 휴무 기록이 있습니다.")
-
-        # 실제 write
-        def _do():
-            # append_log 내부는 "한 줄 쓰기"만 담당
-            return append_log(user_key, user_name, type_, note=note, date_str=ds, by_user=by_user)
-
-        return with_retry(_do)
-
-    finally:
-        with _inflight_lock:
-            _inflight.discard(key)
-    
-# --- 예외를 사람이 읽을 수 있는 메시지로 변환 ---            
-def human_error(e: Exception) -> str:
-    s = str(e)
-    if "이미 오늘" in s or "이미 해당 날짜" in s:
-        return s
-    if "중복 처리 중" in s:
-        return s
-    us = s.upper()
-    if "PERMISSION" in us or "INSUFFICIENT" in us:
-        return "권한 오류. 시트 공유와 API 권한을 확인하세요."
-    if "RATE_LIMIT" in us or "429" in us:
-        return "요청이 많습니다. 잠시 후 다시 시도하세요."
-    return "처리 중 오류가 발생했습니다."
-
 # ---과거 빈 date 백필
 def backfill_dates_from_timestamps():
     ws = logs
@@ -806,34 +1390,6 @@ def backfill_dates_from_timestamps():
             values=[[d]],
             value_input_option="USER_ENTERED",
         )
-
-# --- 중복 기록 검사 및 메시지 생성 ---
-def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None) -> str | None:
-    """
-    폼 제출 단계에서 사전 중복 체크용.
-    guard_and_append와 동일 규칙을 사용해야 한다.
-    """
-    ds = (date_str or today_kst_ymd()).strip()
-    t = action.lower()
-
-    # 출근/퇴근: 하루 1회
-    if t in {"checkin", "checkout"} and already_logged(user_key, t, ds, None):
-        return f"이미 오늘 {t} 기록이 있습니다."
-
-    # 연차: 해당 날짜 1회
-    if t == "annual" and already_logged(user_key, "annual", ds, None):
-        return "이미 해당 날짜에 연차 기록이 있습니다."
-
-    # 반차: 동일 날짜 + 동일 구분(am/pm)만 막음
-    if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag=half_period):
-        tag_txt = "오전" if half_period == "am" else "오후"
-        return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
-
-    # 휴무: 동일 날짜 1회
-    if t == "off" and already_logged(user_key, "off", ds, None):
-        return "이미 해당 날짜에 휴무 기록이 있습니다."
-
-    return None
 
 # --- balances 시트에 행 삽입 또는 업데이트 ---
 def upsert_balances_row(ukey, uname, *, override_left=None, override_from=None, note=""):
@@ -877,13 +1433,7 @@ def upsert_balances_row(ukey, uname, *, override_left=None, override_from=None, 
     for rng, v in updates:
         ws.update(range_name=rng, values=v, value_input_option="USER_ENTERED")
 
-def parse_ymd_safe(s: str):
-    try:
-        y, m, d = map(int, s.split("-"))
-        return dt.date(y, m, d)
-    except Exception:
-        return None
-
+# --- logs 시트에서 사용자 연차/반차 사용량 집계 ---
 def calc_usage_from_logs(user_key: str, *, since: dt.date | None = None, year: int | None = None):
     """logs에서 annual/halfday 사용량 합산."""
     vals = logs.get_all_values()
@@ -926,94 +1476,6 @@ def calc_usage_from_logs(user_key: str, *, since: dt.date | None = None, year: i
 
     return annual_used, half_used
 
-def get_or_create_balance_row(ukey: str, uname: str):
-    ws = sh.worksheet("balances")
-    vals = ws.get_all_values()
-    if not vals:
-        ws.append_row(
-            ["user_key","user_name","annual_total","annual_used","annual_left",
-             "half_used","override_left","override_from","last_admin_update","notes"],
-            value_input_option="USER_ENTERED",
-        )
-        vals = ws.get_all_values()
-
-    head = [h.strip().lower() for h in vals[0]]
-    col = {h: i for i, h in enumerate(head)}
-
-    # 존재 행 탐색
-    rownum = None
-    for rn, r in enumerate(vals[1:], start=2):
-        key = (r[col["user_key"]] if col["user_key"] < len(r) else "").strip().lower()
-        if key == (ukey or "").strip().lower():
-            rownum = rn
-            row = r
-            break
-
-    if rownum is None:
-        rownum = len(vals) + 1
-        row = [""] * len(head)
-        # 신규 행 스켈레톤
-        row[col["user_key"]] = ukey
-        row[col["user_name"]] = uname
-        sh.worksheet("balances").append_row(row, value_input_option="USER_ENTERED")
-        vals = sh.worksheet("balances").get_all_values()
-        row = vals[rownum - 1]
-
-    return rownum, row, head, col
-
-def update_balance_for_user(ukey: str, uname: str):
-    ws = sh.worksheet("balances")
-    rownum, row, head, col = get_or_create_balance_row(ukey, uname)
-
-    def get(name, default=""):
-        i = col.get(name)
-        return (row[i] if i is not None and i < len(row) and row[i] != "" else default)
-
-    # 관리자 기준선이 있으면 우선 사용
-    o_left_raw = get("override_left", "")
-    o_from_raw = get("override_from", "")
-    now = dt.datetime.now(KST)
-
-    updates = {}
-
-    if str(o_left_raw).strip():
-        base = float(str(o_left_raw))
-        since = parse_ymd_safe(str(o_from_raw)) or None
-        au, hu = calc_usage_from_logs(ukey, since=since)
-        left = max(0.0, base - (au + hu))
-        updates["annual_used"] = f"{au:.1f}"
-        updates["half_used"] = f"{hu:.1f}"
-        updates["annual_left"] = f"{left:.1f}"
-    else:
-        # 기준선 없으면: annual_total을 신뢰하고, 올해 사용량으로 계산
-        year = now.year
-        total = float(str(get("annual_total", "0") or "0"))
-        au, hu = calc_usage_from_logs(ukey, year=year)
-        left = max(0.0, total - (au + hu))
-        updates["annual_used"] = f"{au:.1f}"
-        updates["half_used"] = f"{hu:.1f}"
-        updates["annual_left"] = f"{left:.1f}"
-
-    updates["user_key"] = ukey
-    updates["user_name"] = uname
-    updates["last_admin_update"] = now.isoformat(timespec="seconds")
-
-    # sheet 업데이트
-    for name, val in updates.items():
-        i = col.get(name)
-        if i is None:
-            continue
-        col_letter = chr(ord("A") + i)
-        ws.update(
-            range_name=f"{col_letter}{rownum}:{col_letter}{rownum}",
-            values=[[val]],
-            value_input_option="USER_ENTERED",
-        )
-
-    # 최종 잔여 리턴
-    return float(updates["annual_left"])
-
-
 # ---------- 이벤트 핸들러 등록 ----------
 @app.event("app_home_opened")
 def _home_noop(event, logger):
@@ -1024,6 +1486,7 @@ def _home_noop(event, logger):
 def on_mention(body, say):
     say("`/근태` 또는 `출근`/`퇴근` 키워드를 사용하세요.")
     
+# ---------- /출근, /퇴근 커맨드 ----------
 @app.command("/출근")
 def 출근_cmd(ack, body, respond, client):
     ack()
@@ -1032,285 +1495,38 @@ def 출근_cmd(ack, body, respond, client):
     uname = safe_user_name(client, uid)
     ds = today_kst_ymd()
     try:
-        guard_and_append(ukey, uname, "출근", date_str=ds, by_user=ukey)
-        upsert_weekly_schedule_checkin(ukey, ds)
+        # 중복 / 재시도 / 로그 기록까지 포함
+        guard_and_append(ukey, uname, "checkin", date_str=ds, by_user=ukey)
+        # 주간 스케줄 자동 반영 쓰는 경우만
+        try:
+            upsert_weekly_schedule_checkin(ukey, ds)
+        except Exception:
+            pass
         respond(f"{uname} 출근 등록 완료")
     except Exception as e:
         respond(human_error(e))
 
 
-
+# ---------- /퇴근 커맨드 ----------
 @app.command("/퇴근")
 def 퇴근_cmd(ack, body, respond, client):
     ack()
     uid = body["user_id"]
     ukey = safe_user_key(client, uid)
     uname = safe_user_name(client, uid)
+    ds = today_kst_ymd()
     try:
-        guard_and_append(ukey, uname, "퇴근", by_user=ukey)
+        guard_and_append(ukey, uname, "checkout", date_str=ds, by_user=ukey)
         respond(f"{uname} 퇴근 등록 완료")
     except Exception as e:
         respond(human_error(e))
 
-
+# ---------- 출근/퇴근 키워드 핸들러 ----------
 @app.message(re.compile(r"^\s*(출근|퇴근)\s*$"))
 def on_keyword(message, say, context):
     t = "출근" if context["matches"][0] == "출근" else "퇴근"
     append_log(message["user"], "", t)
     say(f"{context['matches'][0]} 등록 완료")
-
-# ---------- /근태: 모달 열기 ----------
-@app.command("/근태")
-def 근태_modal(ack, body, client):
-    ack()
-    view = build_attendance_view(
-        selected_action=None,
-        preserved={"channel_id": body.get("channel_id")},
-    )
-    client.views_open(trigger_id=body["trigger_id"], view=view)
-    
-# --- 커맨드: /근태관리 ---
-# 호출부
-@app.command("/근태관리")
-def admin_modal(ack, body, client, respond):
-    ack()
-    if not is_admin(body["user_id"], client):   # 이제 OK
-        respond("권한 없음.")
-        return
-    client.views_open(trigger_id=body["trigger_id"], view=build_admin_view())
-
-# ---------- 선택 변경 시: 모달 업데이트 ----------
-@app.block_action("action")
-def 근태_action_change(ack, body, client):
-    ack()
-    selected = body["actions"][0]["selected_option"]["value"]  # annual | halfday | off
-    meta = body["view"].get("private_metadata")
-    new_view = build_attendance_view(
-        selected_action=selected,
-        preserved=json.loads(meta or "{}"),
-    )
-    client.views_update(view_id=body["view"]["id"], view=new_view)
-
-# ---------- 제출 처리 ----------
-@app.view("attendance_submit")
-def 근태_submit(ack, body, view, client):
-    vals = view["state"]["values"]
-
-    action = vals["action_b"]["action"]["selected_option"]["value"]  # annual|halfday|off
-    date_start = (vals.get("date_start_b", {}).get("date_start", {}) or {}).get("selected_date")
-    date_end = (vals.get("date_end_b", {}).get("date_end", {}) or {}).get("selected_date")
-    note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
-
-    half_period = None
-    if action == "halfday":
-        hp = vals.get("half_b", {}).get("half_period", {}).get("selected_option")
-        half_period = hp["value"] if hp else None
-
-    uid = body["user"]["id"]
-    ukey = safe_user_key(client, uid)
-    uname = safe_user_name(client, uid)
-
-    errors = {}
-
-    # 1) 기본 검증
-    if action in ("annual", "halfday", "off") and not date_start:
-        errors["date_start_b"] = "시작일을 선택하세요."
-
-    if action in ("annual", "off") and date_start and date_end:
-        if parse_ymd_safe(date_end) and parse_ymd_safe(date_start) and parse_ymd_safe(date_end) < parse_ymd_safe(date_start):
-            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
-
-    if action == "halfday":
-        if not half_period:
-            errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
-
-    # 2) 중복 사전검증
-    if not errors and date_start:
-        # 기간 결정
-        if action in ("annual", "off") and date_end:
-            dates = iter_dates(date_start, date_end)
-        else:
-            dates = [date_start]
-
-        for ds in dates:
-            dup = dup_error_msg_for(action, ukey, ds, half_period)
-            if dup:
-                # 어느 블록에 매핑할지
-                if action == "annual":
-                    errors["date_start_b"] = dup
-                elif action == "off":
-                    errors["date_start_b"] = dup
-                elif action == "halfday":
-                    # halfday 중복은 half_b 또는 date_start_b
-                    errors["half_b" if "반차" in dup or "오전" in dup or "오후" in dup else "date_start_b"] = dup
-                break
-
-    if errors:
-        ack(response_action="errors", errors=errors)
-        return
-
-    # 통과
-    ack()
-
-    # 3) 실제 기록
-    # halfday: 단일 날짜
-    if action == "halfday":
-        ds = date_start
-        if half_period == "am":
-            note_final = f"{note} (오전)"
-        else:
-            note_final = f"{note} (오후)"
-        try:
-            guard_and_append(
-                ukey, uname, "halfday",
-                note=note_final,
-                date_str=ds,
-                by_user=ukey,
-                note_tag=half_period,
-            )
-        except Exception as e:
-            client.chat_postMessage(channel=uid, text=human_error(e))
-            return
-
-    # annual/off: 기간 처리
-    else:
-        if not date_end:
-            date_end = date_start
-        dates = iter_dates(date_start, date_end)
-        for ds in dates:
-            try:
-                guard_and_append(
-                    ukey, uname, action,
-                    note=note,
-                    date_str=ds,
-                    by_user=ukey,
-                    note_tag=None,
-                )
-            except Exception as e:
-                # 한 날짜에서 실패하면 그 내용만 DM으로 알림
-                client.chat_postMessage(
-                    channel=uid,
-                    text=f"{ds} {action} 처리 실패: {human_error(e)}",
-                )
-
-    # 4) 에페메럴 확인 메시지
-    try:
-        meta = json.loads(view.get("private_metadata") or "{}")
-        ch = meta.get("channel_id") or uid
-        if action == "halfday":
-            label = "반차"
-            if half_period == "am":
-                label = "오전 반차"
-            elif half_period == "pm":
-                label = "오후 반차"
-            client.chat_postEphemeral(
-                channel=ch,
-                user=uid,
-                text=f"{label} {date_start} 등록 완료",
-            )
-        elif action == "annual":
-            if date_start == date_end:
-                client.chat_postEphemeral(
-                    channel=ch, user=uid,
-                    text=f"연차 {date_start} 등록 완료",
-                )
-            else:
-                client.chat_postEphemeral(
-                    channel=ch, user=uid,
-                    text=f"연차 {date_start} ~ {date_end} 등록 완료",
-                )
-        elif action == "off":
-            if date_start == date_end:
-                client.chat_postEphemeral(
-                    channel=ch, user=uid,
-                    text=f"휴무 {date_start} 등록 완료",
-                )
-            else:
-                client.chat_postEphemeral(
-                    channel=ch, user=uid,
-                    text=f"휴무 {date_start} ~ {date_end} 등록 완료",
-                )
-    except Exception:
-        pass
-
-
-        
-# --- 제출: admin_attendance_submit ---
-@app.view("admin_attendance_submit")
-def admin_submit(ack, body, view, client):
-    vals = view["state"]["values"]
-    target_uid = vals["target_b"]["target"]["selected_user"]
-    action = vals["action_b"]["action"]["selected_option"]["value"]      # checkin|checkout|annual|halfday
-    date_str = (vals.get("date_b", {}).get("date", {}) or {}).get("selected_date")  # YYYY-MM-DD or None
-    note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
-    half_period = None
-    if action == "halfday":
-        hp = vals.get("half_b", {}).get("half_period", {}).get("selected_option")
-        half_period = hp["value"] if hp else None
-
-    # 기본 필수 검증
-    errors = {}
-    if action in ("annual","halfday") and not date_str:
-        errors["date_b"] = "연차/반차는 날짜가 필요합니다."
-    if action == "halfday" and not half_period:
-        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
-
-    # 사용자 키 준비
-    admin_uid = body["user"]["id"]
-    admin_key = safe_user_key(client, admin_uid)
-    target_key = safe_user_key(client, target_uid)
-    target_name = safe_user_name(client, target_uid)
-
-    # 중복 사전검증
-    if not errors:
-        dup = dup_error_msg_for(action, target_key, date_str or today_kst_ymd(), half_period)
-        if dup:
-            # 블록 위치에 맞춰 에러 핀 지정
-            if action == "annual":
-                errors["date_b"] = dup
-            elif action == "halfday":
-                # 오전/오후 중복이면 half_b, 일반 중복이면 date_b로
-                errors["half_b" if "(오전" in dup or "(오후" in dup else "date_b"] = dup
-            else:
-                errors["action_b"] = dup
-
-    if errors:
-        ack(response_action="errors", errors=errors)
-        # 감사로그는 실패로 남김
-        try:
-            record_admin_request(admin_key, target_key, action, date_str or "", note, "fail", "; ".join(errors.values()))
-        except Exception:
-            pass
-        return
-
-    # 통과 → ack 후 실제 기록
-    ack()
-
-    if action == "halfday":
-        if half_period == "am": note = f"{note} (오전)"
-        elif half_period == "pm": note = f"{note} (오후)"
-
-    try:
-        guard_and_append(target_key, target_name, action, note=note, date_str=(date_str or ""), by_user=admin_key, note_tag=half_period)
-        record_admin_request(admin_key, target_key, action, date_str or "", note, "ok", "")
-        client.chat_postMessage(channel=admin_uid, text=f"[관리자 대리입력] {target_name} {action} {date_str or ''} 처리 완료")
-    except Exception as e:
-        # 여기선 더 이상 raise 금지
-        record_admin_request(admin_key, target_key, action, date_str or "", note, "fail", str(e))
-        client.chat_postMessage(channel=admin_uid, text=f"[관리자 대리입력 실패] {human_error(e)}")
-
-@app.command("/잔여")
-def 잔여_cmd(ack, body, respond, client):
-    ack()
-    uid = body["user_id"]
-    ukey = safe_user_key(client, uid)
-    uname = safe_user_name(client, uid)
-
-    try:
-        left = update_balance_for_user(ukey, uname)
-        respond(f"현재 잔여: {left:g}일")
-    except Exception as e:
-        respond(f"잔여 계산 오류: {e}")
 
 # ---------- /스케줄 커맨드 ----------
 @app.command("/스케줄")
@@ -1339,6 +1555,7 @@ def 스케줄_cmd(ack, body, respond, client):
 
     respond(text=render_week_table(week, r))
 
+# ---------- /잔여갱신 커맨드 + 모달 제출 핸들러 ----------
 @app.command("/잔여갱신")
 def 잔여갱신_modal(ack, body, client, respond):
     ack()
@@ -1348,7 +1565,8 @@ def 잔여갱신_modal(ack, body, client, respond):
     today = dt.datetime.now(KST).date().isoformat()
     client.views_open(trigger_id=body["trigger_id"],
                       view=build_override_view(initial_left="", initial_date=today))
-    
+
+# --- 잔여일수 재정의 모달 제출 핸들러 ---    
 @app.view("override_submit")
 def 잔여갱신_submit(ack, body, view, client):
     vals = view["state"]["values"]
@@ -1401,6 +1619,7 @@ def 잔여갱신_submit(ack, body, view, client):
     except Exception:
         pass
 
+# ---------- /잔여debug 커맨드 (개발용) ----------
 @app.command("/잔여debug")
 def 잔여debug(ack, body, respond, client):
     ack()
