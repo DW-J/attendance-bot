@@ -462,11 +462,10 @@ def is_admin(user_id: str, client=None) -> bool:
 # --- idempotency key 생성 ---
 def idemp_key(user_key: str, type_: str, date_str: str) -> str:
     # date_str 없으면 오늘
-    ds = date_str or dt.datetime.now(KST).date().isoformat()
-    return f"{user_key}|{type_.lower()}|{ds}"
+    return f"{(user_key or '').strip().lower()}|{type_.lower()}|{date_str}"
 
 # --- 지수적 백오프 재시도 ---
-def with_retry(fn: Callable, *, retries=5, base=0.2, max_sleep=2.0):
+def with_retry(fn, retries=5, base=0.2, max_sleep=2.0):
     """
     지수적 백오프 재시도. gspread 네트워크/429 방어.
     """
@@ -481,11 +480,18 @@ def with_retry(fn: Callable, *, retries=5, base=0.2, max_sleep=2.0):
     raise last
 
 # --- 관리자 요청 기록 ---
-def record_admin_request(admin_key, target_key, action, date_str, note, result, error=""):
+def record_admin_request(admin_key, target_key, action, date_str, note, result, error_msg=""):
     ws = get_ws("admin_requests")
+    vals = ws.get_all_values()
+    if not vals:
+        ws.append_row(
+            ["ts_iso","admin_key","target_key","action","date","note","result","error"],
+            value_input_option="USER_ENTERED",
+        )
     now = dt.datetime.now(KST).isoformat(timespec="seconds")
-    row = [now, admin_key, target_key, action, date_str or "", note or "", result, error or ""]
-    return with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+    row = [now, admin_key, target_key, action, date_str or "", note or "", result, error_msg or ""]
+    with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+
 
 # ---------- 에러 핸들러 데코레이터 : 슬래시 커맨드에서 예외 발생 시 통일 메시지. ----------
 def slash_guard(fn):
@@ -675,58 +681,89 @@ def render_week_table(week: str, r: dict) -> str:
     return f"*{week} 주간 스케줄*\n```{header}\n{values}```"
 
 # --- 오늘 이미 기록했는지 검사 ---
-def already_logged_today(user_key: str, type_: str, date_str: str, note_tag: str | None = None) -> bool:
-    ws = logs
-    ds = (date_str or today_kst_ymd()).strip()
-    vals = ws.get_all_values()
-    if not vals: return False
-    head = [h.strip().lower() for h in vals[0]]
-    idx = {h:i for i,h in enumerate(head)}
-    iu = idx.get("user_key") or idx.get("user_id")
-    it = idx.get("type"); idate = idx.get("date"); inote = idx.get("note")
-    if iu is None or it is None or idate is None: return False
+def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | None = None) -> bool:
+    vals = logs.get_all_values()
+    if not vals:
+        return False
 
-    uk_l = (user_key or "").strip().lower()
-    tp_l = (type_ or "").strip().lower()
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    inote = idx.get("note")
+
+    if iu is None or it is None or idate is None:
+        return False
+
+    uk = (user_key or "").strip().lower()
+    tp = type_.lower()
+    ds = date_str.strip()
+
     for r in vals[1:]:
-        uk = (r[iu] if iu < len(r) else "").strip().lower()
-        tp = (r[it] if it < len(r) else "").strip().lower()
-        ds2 = (r[idate] if idate < len(r) else "").strip()
-        if uk != uk_l or tp != tp_l or ds2 != ds:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
             continue
-        # halfday는 오전/오후까지 동일해야 중복으로 간주
-        if tp_l == "halfday" and note_tag:
-            note = (r[inote] if inote is not None and inote < len(r) else "")
+        if (r[iu] or "").strip().lower() != uk:
+            continue
+        if (r[it] or "").strip().lower() != tp:
+            continue
+        if (r[idate] or "").strip() != ds:
+            continue
+
+        # halfday: 오전/오후까지 동일해야 중복
+        if tp == "halfday" and note_tag:
+            if inote is None or inote >= len(r):
+                continue
+            note = r[inote] or ""
             if note_tag == "am" and "(오전)" in note:
                 return True
             if note_tag == "pm" and "(오후)" in note:
                 return True
             continue
+
+        # 나머지는 같은 날 같은 타입이면 중복
         return True
+
     return False
 
 # --- 중복 처리 방지 및 일일 1회 제한 적용 후 기록 추가 ---
 def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None):
     ds = (date_str or today_kst_ymd()).strip()
     key = idemp_key(user_key, type_, ds)
+
+    # 인플라이트 잠금
     with _inflight_lock:
         if key in _inflight:
             raise RuntimeError("중복 처리 중입니다. 잠시 후 다시 시도하세요.")
         _inflight.add(key)
+
     try:
         t = type_.lower()
-        if t in DAILY_UNIQUE and already_logged_today(user_key, t, ds):
+
+        # 출근/퇴근: 하루 1회
+        if t in ("checkin", "checkout") and already_logged(user_key, t, ds, None):
             raise RuntimeError(f"이미 오늘 {t} 기록이 있습니다.")
-        if t == "annual" and already_logged_today(user_key, "annual", ds):
+
+        # 연차: 해당 날짜 1회
+        if t == "annual" and already_logged(user_key, "annual", ds, None):
             raise RuntimeError("이미 해당 날짜에 연차 기록이 있습니다.")
-        if t == "halfday" and already_logged_today(user_key, "halfday", ds, note_tag=note_tag):
-            # 오전/오후 동일 건만 차단
+
+        # 반차: 해당 날짜, 동일 구분(am/pm) 1회
+        if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag):
             tag_txt = "오전" if note_tag == "am" else "오후"
             raise RuntimeError(f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다.")
 
+        # 휴무(off): 같은 날짜 중복 방지
+        if t == "off" and already_logged(user_key, "off", ds, None):
+            raise RuntimeError("이미 해당 날짜에 휴무 기록이 있습니다.")
+
+        # 실제 write
         def _do():
+            # append_log 내부는 "한 줄 쓰기"만 담당
             return append_log(user_key, user_name, type_, note=note, date_str=ds, by_user=by_user)
+
         return with_retry(_do)
+
     finally:
         with _inflight_lock:
             _inflight.discard(key)
@@ -734,14 +771,15 @@ def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=N
 # --- 예외를 사람이 읽을 수 있는 메시지로 변환 ---            
 def human_error(e: Exception) -> str:
     s = str(e)
-    if "PERMISSION" in s.upper():
-        return "권한 오류. 시트 공유와 스코프를 확인하세요."
-    if "429" in s or "Rate Limit" in s:
-        return "요청이 많습니다. 잠시 후 재시도하세요."
-    if "이미 오늘" in s:
+    if "이미 오늘" in s or "이미 해당 날짜" in s:
         return s
     if "중복 처리 중" in s:
         return s
+    us = s.upper()
+    if "PERMISSION" in us or "INSUFFICIENT" in us:
+        return "권한 오류. 시트 공유와 API 권한을 확인하세요."
+    if "RATE_LIMIT" in us or "429" in us:
+        return "요청이 많습니다. 잠시 후 다시 시도하세요."
     return "처리 중 오류가 발생했습니다."
 
 # ---과거 빈 date 백필
@@ -771,15 +809,30 @@ def backfill_dates_from_timestamps():
 
 # --- 중복 기록 검사 및 메시지 생성 ---
 def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None) -> str | None:
-    t = action.lower()
+    """
+    폼 제출 단계에서 사전 중복 체크용.
+    guard_and_append와 동일 규칙을 사용해야 한다.
+    """
     ds = (date_str or today_kst_ymd()).strip()
-    if t in {"checkin","checkout"} and already_logged_today(user_key, t, ds):
+    t = action.lower()
+
+    # 출근/퇴근: 하루 1회
+    if t in {"checkin", "checkout"} and already_logged(user_key, t, ds, None):
         return f"이미 오늘 {t} 기록이 있습니다."
-    if t == "annual" and already_logged_today(user_key, "annual", ds):
+
+    # 연차: 해당 날짜 1회
+    if t == "annual" and already_logged(user_key, "annual", ds, None):
         return "이미 해당 날짜에 연차 기록이 있습니다."
-    if t == "halfday" and already_logged_today(user_key, "halfday", ds, note_tag=half_period):
+
+    # 반차: 동일 날짜 + 동일 구분(am/pm)만 막음
+    if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag=half_period):
         tag_txt = "오전" if half_period == "am" else "오후"
         return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
+
+    # 휴무: 동일 날짜 1회
+    if t == "off" and already_logged(user_key, "off", ds, None):
+        return "이미 해당 날짜에 휴무 기록이 있습니다."
+
     return None
 
 # --- balances 시트에 행 삽입 또는 업데이트 ---
