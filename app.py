@@ -8,6 +8,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google.oauth2.service_account import Credentials
 from typing import Callable
+from datetime import timedelta
 
 load_dotenv()
 
@@ -42,8 +43,25 @@ user_email_cache = {}
 # --- 날짜 문자열 파싱 ---
 def parse_date(s):
     try:
-        y,m,d = map(int, s.split("-")); return dt.date(y,m,d)
-    except Exception: return None
+        y,m,d = map(int, s.split("-")); 
+        return dt.date(y,m,d)
+    except Exception: 
+        return None
+    
+def iter_dates(start_s: str, end_s: str):
+    start = parse_ymd_safe(start_s)
+    end = parse_ymd_safe(end_s)
+    if not start or not end:
+        return []
+    if end < start:
+        return []
+    cur = start
+    one = timedelta(days=1)
+    out = []
+    while cur <= end:
+        out.append(cur.isoformat())
+        cur += one
+    return out
 
 # --- 오늘 KST 날짜 문자열 ---    
 def today_kst_ymd():
@@ -480,32 +498,43 @@ def slash_guard(fn):
 
 
 # ---------- 뷰 생성기 ----------
-def build_attendance_view(selected_action=None, preserved=None):
+def build_attendance_view(selected_action: str | None = None, preserved: dict | None = None):
     action_options = [
         {"text": {"type": "plain_text", "text": "연차"},  "value": "annual"},
         {"text": {"type": "plain_text", "text": "반차"},  "value": "halfday"},
+        {"text": {"type": "plain_text", "text": "휴무"},  "value": "off"},
     ]
+
     blocks = [
         {
             "type": "input",
             "block_id": "action_b",
-            "dispatch_action": True,  # 여기
+            "dispatch_action": True,  # 선택 시 block_action 발생
             "label": {"type": "plain_text", "text": "항목"},
             "element": {
                 "type": "static_select",
                 "action_id": "action",
                 "placeholder": {"type": "plain_text", "text": "선택하세요"},
                 "options": action_options,
-                **({"initial_option": next((o for o in action_options if o["value"] == selected_action), None)}
-                   if selected_action else {})
+                **(
+                    {"initial_option":
+                        next((o for o in action_options if o["value"] == selected_action), None)
+                      } if selected_action else {}
+                )
             },
         },
         {
             "type": "input",
-            "block_id": "date_b",
+            "block_id": "date_start_b",
+            "label": {"type": "plain_text", "text": "시작일"},
+            "element": {"type": "datepicker", "action_id": "date_start"},
+        },
+        {
+            "type": "input",
+            "block_id": "date_end_b",
             "optional": True,
-            "label": {"type": "plain_text", "text": "날짜(연차/반차)"},
-            "element": {"type": "datepicker", "action_id": "date"},
+            "label": {"type": "plain_text", "text": "종료일 (연차/휴무 기간용, 미선택 시 시작일과 동일)"},
+            "element": {"type": "datepicker", "action_id": "date_end"},
         },
         {
             "type": "input",
@@ -515,36 +544,11 @@ def build_attendance_view(selected_action=None, preserved=None):
             "element": {"type": "plain_text_input", "action_id": "note"},
         },
     ]
-    # 반차일 때만 오전/오후 라디오 추가
-    if selected_action == "halfday":
-        blocks.insert(2, {
-            "type": "input",
-            "block_id": "half_b",
-            "label": {"type": "plain_text", "text": "반차 구분"},
-            "element": {
-                "type": "radio_buttons",
-                "action_id": "half_period",
-                "options": [
-                    {"text": {"type": "plain_text", "text": "오전(AM)"}, "value": "am"},
-                    {"text": {"type": "plain_text", "text": "오후(PM)"}, "value": "pm"},
-                ],
-            },
-        })
 
-    return {
-        "type": "modal",
-        "callback_id": "attendance_submit",
-        "title": {"type": "plain_text", "text": "근태 등록"},
-        "submit": {"type": "plain_text", "text": "저장"},
-        "close": {"type": "plain_text", "text": "취소"},
-        "private_metadata": json.dumps(preserved or {}),
-        "blocks": blocks,
-    }
-
-    # 반차일 때만 오전/오후 라디오 추가
+    # 반차일 때만 오전/오후 선택 추가
     if selected_action == "halfday":
         blocks.insert(
-            2,
+            3,
             {
                 "type": "input",
                 "block_id": "half_b",
@@ -553,8 +557,14 @@ def build_attendance_view(selected_action=None, preserved=None):
                     "type": "radio_buttons",
                     "action_id": "half_period",
                     "options": [
-                        {"text": {"type": "plain_text", "text": "오전(AM)"}, "value": "am"},
-                        {"text": {"type": "plain_text", "text": "오후(PM)"}, "value": "pm"},
+                        {
+                            "text": {"type": "plain_text", "text": "오전(AM)"},
+                            "value": "am",
+                        },
+                        {
+                            "text": {"type": "plain_text", "text": "오후(PM)"},
+                            "value": "pm",
+                        },
                     ],
                 },
             },
@@ -969,7 +979,7 @@ def 출근_cmd(ack, body, respond, client):
     uname = safe_user_name(client, uid)
     ds = today_kst_ymd()
     try:
-        guard_and_append(ukey, uname, "checkin", date_str=ds, by_user=ukey)
+        guard_and_append(ukey, uname, "출근", date_str=ds, by_user=ukey)
         upsert_weekly_schedule_checkin(ukey, ds)
         respond(f"{uname} 출근 등록 완료")
     except Exception as e:
@@ -984,7 +994,7 @@ def 퇴근_cmd(ack, body, respond, client):
     ukey = safe_user_key(client, uid)
     uname = safe_user_name(client, uid)
     try:
-        guard_and_append(ukey, uname, "checkout", by_user=ukey)
+        guard_and_append(ukey, uname, "퇴근", by_user=ukey)
         respond(f"{uname} 퇴근 등록 완료")
     except Exception as e:
         respond(human_error(e))
@@ -1002,7 +1012,7 @@ def 근태_modal(ack, body, client):
     ack()
     view = build_attendance_view(
         selected_action=None,
-        preserved={"channel_id": body.get("channel_id")}
+        preserved={"channel_id": body.get("channel_id")},
     )
     client.views_open(trigger_id=body["trigger_id"], view=view)
     
@@ -1018,21 +1028,24 @@ def admin_modal(ack, body, client, respond):
 
 # ---------- 선택 변경 시: 모달 업데이트 ----------
 @app.block_action("action")
-def on_action_change(ack, body, client):
+def 근태_action_change(ack, body, client):
     ack()
-    selected = body["actions"][0]["selected_option"]["value"]  # "annual" or "halfday"
-    view_id = body["view"]["id"]
-    # 기존 private_metadata 유지
+    selected = body["actions"][0]["selected_option"]["value"]  # annual | halfday | off
     meta = body["view"].get("private_metadata")
-    new_view = build_attendance_view(selected_action=selected, preserved=json.loads(meta or "{}"))
-    client.views_update(view_id=view_id, view=new_view)
+    new_view = build_attendance_view(
+        selected_action=selected,
+        preserved=json.loads(meta or "{}"),
+    )
+    client.views_update(view_id=body["view"]["id"], view=new_view)
 
 # ---------- 제출 처리 ----------
 @app.view("attendance_submit")
 def 근태_submit(ack, body, view, client):
     vals = view["state"]["values"]
-    action = vals["action_b"]["action"]["selected_option"]["value"]  # annual|halfday|checkin|checkout
-    selected_date = (vals.get("date_b", {}).get("date", {}) or {}).get("selected_date")
+
+    action = vals["action_b"]["action"]["selected_option"]["value"]  # annual|halfday|off
+    date_start = (vals.get("date_start_b", {}).get("date_start", {}) or {}).get("selected_date")
+    date_end = (vals.get("date_end_b", {}).get("date_end", {}) or {}).get("selected_date")
     note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
 
     half_period = None
@@ -1040,57 +1053,133 @@ def 근태_submit(ack, body, view, client):
         hp = vals.get("half_b", {}).get("half_period", {}).get("selected_option")
         half_period = hp["value"] if hp else None
 
-    # 사용자 키/이름
     uid = body["user"]["id"]
     ukey = safe_user_key(client, uid)
     uname = safe_user_name(client, uid)
 
-    # 1) 필수값 검증
     errors = {}
-    if action in ("annual","halfday") and not selected_date:
-        errors["date_b"] = "연차/반차는 날짜가 필요합니다."
-    if action == "halfday" and not half_period:
-        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
+
+    # 1) 기본 검증
+    if action in ("annual", "halfday", "off") and not date_start:
+        errors["date_start_b"] = "시작일을 선택하세요."
+
+    if action in ("annual", "off") and date_start and date_end:
+        if parse_ymd_safe(date_end) and parse_ymd_safe(date_start) and parse_ymd_safe(date_end) < parse_ymd_safe(date_start):
+            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
+
+    if action == "halfday":
+        if not half_period:
+            errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
 
     # 2) 중복 사전검증
-    if not errors:
-        dup = dup_error_msg_for(action, ukey, selected_date or today_kst_ymd(), half_period)
-        if dup:
-            # 블록 위치를 맞춰 에러 핀
-            if action == "annual":
-                errors["date_b"] = dup
-            elif action == "halfday":
-                # 오전/오후 중복이면 half_b, 그 외는 date_b
-                errors["half_b" if "반차" in dup else "date_b"] = dup
-            else:
-                errors["action_b"] = dup
+    if not errors and date_start:
+        # 기간 결정
+        if action in ("annual", "off") and date_end:
+            dates = iter_dates(date_start, date_end)
+        else:
+            dates = [date_start]
 
-    # 3) 에러 있으면 폼 에러로 응답하고 종료
+        for ds in dates:
+            dup = dup_error_msg_for(action, ukey, ds, half_period)
+            if dup:
+                # 어느 블록에 매핑할지
+                if action == "annual":
+                    errors["date_start_b"] = dup
+                elif action == "off":
+                    errors["date_start_b"] = dup
+                elif action == "halfday":
+                    # halfday 중복은 half_b 또는 date_start_b
+                    errors["half_b" if "반차" in dup or "오전" in dup or "오후" in dup else "date_start_b"] = dup
+                break
+
     if errors:
         ack(response_action="errors", errors=errors)
         return
 
-    # 4) 통과 → ack 후 기록
+    # 통과
     ack()
 
+    # 3) 실제 기록
+    # halfday: 단일 날짜
     if action == "halfday":
-        if half_period == "am": note = f"{note} (오전)"
-        elif half_period == "pm": note = f"{note} (오후)"
-
-    try:
-        guard_and_append(
-            ukey, uname, action,
-            note=note,
-            date_str=(selected_date or ""),
-            by_user=ukey,
-            note_tag=half_period
-        )
-    except Exception as e:
-        # 예외는 DM로 알려줌. 뷰는 이미 닫힘.
+        ds = date_start
+        if half_period == "am":
+            note_final = f"{note} (오전)"
+        else:
+            note_final = f"{note} (오후)"
         try:
+            guard_and_append(
+                ukey, uname, "halfday",
+                note=note_final,
+                date_str=ds,
+                by_user=ukey,
+                note_tag=half_period,
+            )
+        except Exception as e:
             client.chat_postMessage(channel=uid, text=human_error(e))
-        except Exception:
-            pass
+            return
+
+    # annual/off: 기간 처리
+    else:
+        if not date_end:
+            date_end = date_start
+        dates = iter_dates(date_start, date_end)
+        for ds in dates:
+            try:
+                guard_and_append(
+                    ukey, uname, action,
+                    note=note,
+                    date_str=ds,
+                    by_user=ukey,
+                    note_tag=None,
+                )
+            except Exception as e:
+                # 한 날짜에서 실패하면 그 내용만 DM으로 알림
+                client.chat_postMessage(
+                    channel=uid,
+                    text=f"{ds} {action} 처리 실패: {human_error(e)}",
+                )
+
+    # 4) 에페메럴 확인 메시지
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        ch = meta.get("channel_id") or uid
+        if action == "halfday":
+            label = "반차"
+            if half_period == "am":
+                label = "오전 반차"
+            elif half_period == "pm":
+                label = "오후 반차"
+            client.chat_postEphemeral(
+                channel=ch,
+                user=uid,
+                text=f"{label} {date_start} 등록 완료",
+            )
+        elif action == "annual":
+            if date_start == date_end:
+                client.chat_postEphemeral(
+                    channel=ch, user=uid,
+                    text=f"연차 {date_start} 등록 완료",
+                )
+            else:
+                client.chat_postEphemeral(
+                    channel=ch, user=uid,
+                    text=f"연차 {date_start} ~ {date_end} 등록 완료",
+                )
+        elif action == "off":
+            if date_start == date_end:
+                client.chat_postEphemeral(
+                    channel=ch, user=uid,
+                    text=f"휴무 {date_start} 등록 완료",
+                )
+            else:
+                client.chat_postEphemeral(
+                    channel=ch, user=uid,
+                    text=f"휴무 {date_start} ~ {date_end} 등록 완료",
+                )
+    except Exception:
+        pass
+
 
         
 # --- 제출: admin_attendance_submit ---
