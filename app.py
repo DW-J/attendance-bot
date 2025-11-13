@@ -168,7 +168,7 @@ def append_log(user_key, user_name, type_, note="", date_str="", by_user=None):
     with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
 
 # --- 오늘 이미 기록했는지 검사 ---
-def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | None = None) -> bool:
+def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | None = None, alt_user_key: str | None = None) -> bool:
     ws = get_ws("logs")
     vals = ws.get_all_values()
     if not vals:
@@ -176,31 +176,43 @@ def already_logged(user_key: str, type_: str, date_str: str, note_tag: str | Non
 
     head = [h.strip().lower() for h in vals[0]]
     idx = {h: i for i, h in enumerate(head)}
-
     iu = idx.get("user_key") or idx.get("user_id")
     it = idx.get("type")
     idate = idx.get("date")
     inote = idx.get("note")
-
     if iu is None or it is None or idate is None:
         return False
 
-    uk = (user_key or "").strip().lower()
-    tp = type_.lower()
-    ds = (date_str or "").strip()
+    # --- 정규화 ---
+    want_type = (type_ or "").strip().lower()
+    want_date = (date_str or "").strip()
+    uk_primary = (user_key or "").strip().lower()
+    uk_alt = (alt_user_key or "").strip().lower()
+    def is_same_user(cell: str) -> bool:
+        v = (cell or "").strip().lower()
+        return v == uk_primary or (uk_alt and v == uk_alt)
 
     for r in vals[1:]:
         if iu >= len(r) or it >= len(r) or idate >= len(r):
             continue
-
-        uk2 = (r[iu] or "").strip().lower()
-        tp2 = (r[it] or "").strip().lower()
-        ds2 = (r[idate] or "").strip()
-
-        if uk2 != uk or tp2 != tp or ds2 != ds:
+        if not is_same_user(r[iu]):
+            continue
+        if (r[it] or "").strip().lower() != want_type:
+            continue
+        if (r[idate] or "").strip() != want_date:
             continue
 
-        # halfday 예외는 생략, 출퇴근에는 영향 없음
+        # 반차는 오전/오후까지 동일해야 중복
+        if want_type == "halfday" and note_tag:
+            if inote is None or inote >= len(r):
+                continue
+            note = r[inote] or ""
+            if note_tag == "am" and "(오전)" in note:
+                return True
+            if note_tag == "pm" and "(오후)" in note:
+                return True
+            continue
+
         return True
 
     return False
@@ -212,32 +224,34 @@ def idemp_key(user_key: str, type_: str, date_str: str) -> str:
     return f"{(user_key or '').strip().lower()}|{type_.lower()}|{date_str}"
 
 # --- 중복 처리 방지 및 일일 1회 제한 적용 후 기록 추가 ---
-def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None):
+def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None, alt_user_key: str | None = None):
     ds = (date_str or today_kst_ymd()).strip()
-    key = idemp_key(user_key, type_, ds)
+    t = (type_ or "").strip().lower()
+    key = idemp_key(user_key, t, ds)
 
     with _inflight_lock:
         if key in _inflight:
             raise RuntimeError("중복 처리 중입니다. 잠시 후 다시 시도하세요.")
         _inflight.add(key)
-
     try:
-        t = type_.lower()
-
-        if t in ("checkin", "checkout") and already_logged(user_key, t, ds, None):
+        if t in ("checkin", "checkout") and already_logged(user_key, t, ds, alt_user_key=alt_user_key):
             raise RuntimeError(f"이미 오늘 {t} 기록이 있습니다.")
-
-        # (annual/halfday/off는 그대로)
+        if t == "annual" and already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
+            raise RuntimeError("이미 해당 날짜에 연차 기록이 있습니다.")
+        if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag=note_tag, alt_user_key=alt_user_key):
+            tag_txt = "오전" if note_tag == "am" else "오후"
+            raise RuntimeError(f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다.")
+        if t == "off" and already_logged(user_key, "off", ds, alt_user_key=alt_user_key):
+            raise RuntimeError("이미 해당 날짜에 휴무 기록이 있습니다.")
 
         def _do():
+            # 타입/날짜 최종 정규화해서 기록
             return append_log(user_key, user_name, t, note=note, date_str=ds, by_user=by_user)
-
         return with_retry(_do)
-
     finally:
         with _inflight_lock:
             _inflight.discard(key)
-            
+
 # --- 중복 기록 검사 및 메시지 생성 ---
 def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None) -> str | None:
     """
@@ -477,6 +491,7 @@ def 근태_submit(ack, body, view, client, logger):
                     note=note,
                     date_str=ds,
                     by_user=ukey,
+                    alt_user_key=uid, # Slack ID 대체키
                 )
 
         else:
@@ -489,6 +504,7 @@ def 근태_submit(ack, body, view, client, logger):
                 note=note,
                 date_str=ds,
                 by_user=ukey,
+                
             )
 
     except Exception as e:
@@ -732,21 +748,21 @@ def admin_submit(ack, body, view, client):
                 note_final += " (오후)"
             guard_and_append(target_key, target_name, "halfday",
                              note=note_final, date_str=ds,
-                             by_user=admin_key, note_tag=half_period)
+                             by_user=admin_key, note_tag=half_period, alt_user_key=target_uid)
             record_admin_request(admin_key, target_key, "halfday", ds, note_final, "ok", "")
         elif action in ("annual", "off"):
             if not date_end:
                 date_end = date_start
             for ds in iter_dates(date_start, date_end):
                 guard_and_append(target_key, target_name, action,
-                                 note=note, date_str=ds, by_user=admin_key)
+                                 note=note, date_str=ds, by_user=admin_key, alt_user_key=target_uid)
             record_admin_request(admin_key, target_key, action,
                                  f"{date_start}~{date_end}" if date_end != date_start else date_start,
                                  note, "ok", "")
         else:  # checkin / checkout
             ds = date_start or today_kst_ymd()
             guard_and_append(target_key, target_name, action,
-                             note=note, date_str=ds, by_user=admin_key)
+                             note=note, date_str=ds, by_user=admin_key, alt_user_key=target_uid)
             record_admin_request(admin_key, target_key, action, ds, note, "ok", "")
         # 관리자에게 결과 안내
         client.chat_postMessage(
@@ -1523,7 +1539,7 @@ def 출근_cmd(ack, body, respond, client):
     ds = today_kst_ymd()
     try:
         # 중복 / 재시도 / 로그 기록까지 포함
-        guard_and_append(ukey, uname, "checkin", date_str=ds, by_user=ukey)
+        guard_and_append(ukey, uname, "checkin", date_str=ds, by_user=ukey, alt_user_key=uid)
         # 주간 스케줄 자동 반영 쓰는 경우만
         try:
             upsert_weekly_schedule_checkin(ukey, ds)
@@ -1543,7 +1559,7 @@ def 퇴근_cmd(ack, body, respond, client):
     uname = safe_user_name(client, uid)
     ds = today_kst_ymd()
     try:
-        guard_and_append(ukey, uname, "checkout", date_str=ds, by_user=ukey)
+        guard_and_append(ukey, uname, "checkout", date_str=ds, by_user=ukey, alt_user_key=uid)
         respond(f"{uname} 퇴근 등록 완료")
     except Exception as e:
         respond(human_error(e))
