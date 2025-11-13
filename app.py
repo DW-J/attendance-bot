@@ -1,3 +1,17 @@
+# 실행 엔트리
+import os, json, re, datetime as dt, pytz, gspread
+from google.oauth2.service_account import Credentials
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+from core_utils import human_error, today_kst_ymd
+from sheets_repo import set_sheet
+from services import (
+    safe_user_key, safe_user_name, is_admin,
+    guard_and_append, update_balance_for_user,
+    render_week_table_vertical
+)
+
 import os, re, pytz, datetime as dt
 import gspread
 import json
@@ -30,7 +44,13 @@ DAILY_UNIQUE = {"checkin","checkout"}  # 하루 1회만 허용하는 타입
 
 DOW_COLS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
 
+# --- Google Sheets client ---
+gc = gspread.service_account(filename="service_account.json")
+sh = gc.open_by_key(os.environ["SHEET_ID"])
+set_sheet(sh)  # <<<<<< 중요: repo에 주입
 
+# --- Slack app ---
+app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # 캐시
 user_cache = {}
@@ -968,33 +988,61 @@ def 잔여_cmd(ack, body, respond, client):
         ukey = safe_user_key(client, uid)
         uname = safe_user_name(client, uid)
 
+        # balances 갱신(annual_used/half_used/annual_left 갱신됨)
         left = update_balance_for_user(ukey, uname)
 
-        # override 기반인지, total 기반인지 간단 표시 (선택)
         ws = get_ws("balances")
         vals = ws.get_all_values()
         head = [h.strip().lower() for h in vals[0]] if vals else []
         col = {h: i for i, h in enumerate(head)}
+
+        # 대상 행 찾기
         row = None
-        for rn, r in enumerate(vals[1:], start=2):
+        for r in vals[1:]:
             if col.get("user_key", 0) < len(r) and (r[col["user_key"]] or "").strip().lower() == ukey.lower():
                 row = r
                 break
 
-        detail = ""
-        if row and "override_left" in col:
-            o = (row[col["override_left"]] if col["override_left"] < len(row) else "").strip()
-            if o != "":
-                detail = f"(관리자 기준선 {o}일 기준)"
-        if not detail and row and "annual_total" in col:
-            t = (row[col["annual_total"]] if col["annual_total"] < len(row) else "").strip()
-            if t != "":
-                detail = f"(연차 총 {t}일 기준)"
+        # 안전 추출 유틸
+        def getc(name, default=""):
+            i = col.get(name)
+            if i is None or row is None or i >= len(row):
+                return default
+            return (row[i] or "").strip()
 
-        if detail:
-            respond(f"현재 잔여: {left:g}일 {detail}")
+        def f1(x):
+            try:
+                return f"{float(x):.1f}"
+            except Exception:
+                return x if x != "" else "-"
+
+        # 값 추출
+        annual_total = getc("annual_total", "")
+        annual_used  = getc("annual_used", "")
+        half_used    = getc("half_used", "")
+        annual_left  = getc("annual_left", "")  # update_balance_for_user가 방금 쓴 값
+        override_left = getc("override_left", "")
+        override_from = getc("override_from", "")
+
+        # 기준 설명
+        if override_left != "":
+            basis = f"(관리자 기준선 {override_left}일" + (f", 기준일 {override_from}" if override_from else "") + ")"
+        elif annual_total != "":
+            basis = f"(연차 총 {annual_total}일)"
         else:
-            respond(f"현재 잔여: {left:g}일")
+            basis = ""
+
+        # 출력
+        msg = (
+            f"*{uname} 님 잔여 요약*\n"
+            f"• 총 연차: {f1(annual_total)}일\n"
+            f"• 사용한 연차: {f1(annual_used)}일\n"
+            f"• 사용한 반차: {f1(half_used)}일\n"
+            f"• 남은 연차: {f1(annual_left if annual_left != '' else left)}일"
+            + (f"\n_{basis}_" if basis else "")
+        )
+        respond(msg)
+
     except Exception as e:
         respond(f"잔여 계산 오류: {human_error(e)}")
 
@@ -1349,22 +1397,23 @@ def pad_right(s: str, target: int) -> str:
 
 # --- 주간 스케줄 테이블 렌더링 ---  
 def render_week_table(week: str, r: dict) -> str:
-    cols = [("월", r.get("Mon", "-") or "-"),
+    rows = [
+        ("월", r.get("Mon", "-") or "-"),
             ("화", r.get("Tue", "-") or "-"),
             ("수", r.get("Wed", "-") or "-"),
             ("목", r.get("Thu", "-") or "-"),
             ("금", r.get("Fri", "-") or "-"),
             ("토", r.get("Sat", "-") or "-"),
-            ("일", r.get("Sun", "-") or "-")]
+            ("일", r.get("Sun", "-") or "-")
+            ]
 
-    # 각 칸 최소폭 2. 헤더/값 중 큰 표시폭으로 고정
-    widths = []
-    for k, v in cols:
-        widths.append(max(2, disp_width(k), disp_width(v)))
-    header = " ".join(pad_right(k, w) for (k, _), w in zip(cols, widths))
-    values = " ".join(pad_right(v, w) for (_, v), w in zip(cols, widths))
+    # 열 너비 계산 (가독성 정렬)
+    w_day = max(2, max(disp_width(k) for k, _ in rows))
+    w_val = max(2, max(disp_width(v) for _, v in rows))
 
-    return f"*{week} 주간 스케줄*\n```{header}\n{values}```"
+    lines = [f"{pad_right(k, w_day)} - {pad_right(v, w_val)}" for k, v in rows]
+    body = "\n".join(lines)
+    return f"*{week} 주간 스케줄*\n```{body}```"
 
 # ---과거 빈 date 백필
 def backfill_dates_from_timestamps():
@@ -1640,6 +1689,16 @@ def 잔여debug(ack, body, respond, client):
     }
     respond(f"```{resp}```")
 
+@app.event({"type": "message", "subtype": "channel_join"})
+def on_join(body, client):
+    ev = body["event"]
+    user = ev.get("user")
+    channel = ev.get("channel")
+    if user and channel:
+        client.chat_postMessage(
+            channel=channel,
+            text=f"<@{user}> 님 환영합니다. `/출근`, `/퇴근`, `/근태`를 사용해보세요."
+        )
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
