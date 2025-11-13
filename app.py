@@ -1,17 +1,3 @@
-# 실행 엔트리
-import os, json, re, datetime as dt, pytz, gspread
-from google.oauth2.service_account import Credentials
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
-
-from core_utils import human_error, today_kst_ymd
-from sheets_repo import set_sheet
-from services import (
-    safe_user_key, safe_user_name, is_admin,
-    guard_and_append, update_balance_for_user,
-    render_week_table_vertical
-)
-
 import os, re, pytz, datetime as dt
 import gspread
 import json
@@ -43,14 +29,6 @@ DEDUP_WINDOW_SEC = 60          # 동일 사용자/타입/날짜 60초 내 중복
 DAILY_UNIQUE = {"checkin","checkout"}  # 하루 1회만 허용하는 타입
 
 DOW_COLS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-
-# --- Google Sheets client ---
-gc = gspread.service_account(filename="service_account.json")
-sh = gc.open_by_key(os.environ["SHEET_ID"])
-set_sheet(sh)  # <<<<<< 중요: repo에 주입
-
-# --- Slack app ---
-app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # 캐시
 user_cache = {}
