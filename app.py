@@ -37,6 +37,9 @@ user_email_cache = {}
 ADMIN_ID_SET = {s.strip() for s in (os.getenv("ADMIN_IDS") or "").split(",") if s.strip()} # Slack 사용자 ID 화이트리스트
 ADMIN_EMAIL_SET = {e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()} # 이메일 화이트리스트
 
+# --- Business day helpers ---
+HOLIDAYS_CACHE = None  # set[str] of "YYYY-MM-DD"
+
 # --- 관리자 여부 확인 ---
 def is_admin(user_id: str, client=None) -> bool:
     # 1) ID 화이트리스트
@@ -483,7 +486,15 @@ def 근태_submit(ack, body, view, client, logger):
         elif action in ("annual", "off"):
             if not date_end:
                 date_end = date_start
-            for ds in iter_dates(date_start, date_end):
+
+            # annual 은 평일/영업일만 기록, off는 원하는 정책에 맞게 선택
+            if action == "annual":
+                dates_iter = iter_business_dates(date_start, date_end)
+            else:
+                # 휴무(off)는 보통 잔여 차감 대상이 아니므로 전체 날짜 기록해도 됨
+                dates_iter = iter_dates(date_start, date_end)
+
+            for ds in dates_iter:
                 guard_and_append(
                     ukey,
                     uname,
@@ -491,7 +502,6 @@ def 근태_submit(ack, body, view, client, logger):
                     note=note,
                     date_str=ds,
                     by_user=ukey,
-                    alt_user_key=uid, # Slack ID 대체키
                 )
 
         else:
@@ -753,12 +763,15 @@ def admin_submit(ack, body, view, client):
         elif action in ("annual", "off"):
             if not date_end:
                 date_end = date_start
-            for ds in iter_dates(date_start, date_end):
+            if action == "annual":
+                dates_iter = iter_business_dates(date_start, date_end)
+            else:
+                dates_iter = iter_dates(date_start, date_end)
+            for ds in dates_iter:
                 guard_and_append(target_key, target_name, action,
-                                 note=note, date_str=ds, by_user=admin_key, alt_user_key=target_uid)
-            record_admin_request(admin_key, target_key, action,
-                                 f"{date_start}~{date_end}" if date_end != date_start else date_start,
-                                 note, "ok", "")
+                                note=note, date_str=ds, by_user=admin_key,
+                                alt_user_key=target_uid)
+
         else:  # checkin / checkout
             ds = date_start or today_kst_ymd()
             guard_and_append(target_key, target_name, action,
@@ -1693,6 +1706,96 @@ def on_join(body, client):
             channel=channel,
             text=f"<@{user}> 님 환영합니다. `/출근`, `/퇴근`, `/근태`를 사용해보세요."
         )
+
+def load_holidays() -> set[str]:
+    """holidays 시트 1열에 YYYY-MM-DD가 있다고 가정."""
+    global HOLIDAYS_CACHE
+    if HOLIDAYS_CACHE is not None:
+        return HOLIDAYS_CACHE
+    try:
+        ws = get_ws("holidays")
+        vals = ws.get_all_values()
+        s = set()
+        for r in vals[1:] if vals and vals[0] else vals:
+            if not r:
+                continue
+            d = (r[0] or "").strip()
+            if parse_ymd_safe(d):
+                s.add(d)
+        HOLIDAYS_CACHE = s
+        return s
+    except Exception:
+        HOLIDAYS_CACHE = set()
+        return HOLIDAYS_CACHE
+
+def is_weekend(d: dt.date) -> bool:
+    # 월=0 ... 일=6
+    return d.weekday() >= 5
+
+def is_holiday(d: dt.date) -> bool:
+    return d.isoformat() in load_holidays()
+
+def is_business_day(d: dt.date) -> bool:
+    return (not is_weekend(d)) and (not is_holiday(d))
+
+def iter_business_dates(start_s: str, end_s: str):
+    for s in iter_dates(start_s, end_s):
+        d = parse_ymd_safe(s)
+        if d and is_business_day(d):
+            yield s
+
+def logs_usage_since(user_key: str, since_date: dt.date | None = None, year: int | None = None):
+    """
+    annual: 1.0, halfday: 0.5
+    단, 주말/공휴일 기록은 차감하지 않음.
+    """
+    ws = get_ws("logs")
+    vals = ws.get_all_values()
+    if not vals:
+        return 0.0, 0.0
+
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    if iu is None or it is None or idate is None:
+        return 0.0, 0.0
+
+    target = (user_key or "").strip().lower()
+    annual_used = 0.0
+    half_used = 0.5 * 0  # 명시
+
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+
+        uk = (r[iu] or "").strip().lower()
+        if uk != target:
+            continue
+
+        t = (r[it] or "").strip().lower()
+        d = parse_ymd_safe((r[idate] or "").strip())
+        if not d:
+            continue
+
+        # 범위/연도 필터
+        if since_date and d < since_date:
+            continue
+        if year and d.year != year:
+            continue
+
+        # 주말/공휴일은 차감 제외
+        if not is_business_day(d):
+            continue
+
+        if t == "annual":
+            annual_used += 1.0
+        elif t == "halfday":
+            half_used += 0.5
+
+    return annual_used, half_used
+
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
