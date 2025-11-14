@@ -37,8 +37,63 @@ user_email_cache = {}
 ADMIN_ID_SET = {s.strip() for s in (os.getenv("ADMIN_IDS") or "").split(",") if s.strip()} # Slack 사용자 ID 화이트리스트
 ADMIN_EMAIL_SET = {e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()} # 이메일 화이트리스트
 
+# 과거 날짜 입력 정책
+ALLOW_BACKDATE_USER = False   # 사용자는 과거 입력 금지
+ALLOW_FUTURE_YEAR_USER = False   # 사용자: 현재 연도 이후 금지
+
+ALLOW_BACKDATE_ADMIN = True   # 관리자는 허용(원하면 False로)
+ALLOW_FUTURE_YEAR_ADMIN = True   # 관리자 예외 (원하면 False)
+
 # --- Business day helpers ---
 HOLIDAYS_CACHE = None  # set[str] of "YYYY-MM-DD"
+
+REQUIRED_SHEETS = ("logs", "balances", "schedule_weekly", "holidays")
+
+def sheet_exists(name: str) -> bool:
+    try:
+        get_ws(name)
+        return True
+    except Exception:
+        return False
+
+def require_sheets_or_error(names=REQUIRED_SHEETS) -> str | None:
+    missing = [n for n in names if not sheet_exists(n)]
+    if missing:
+        return "시트가 없습니다: " + ", ".join(missing)
+    return None
+
+def this_year() -> int:
+    return today_kst_date().year
+
+
+def year_of(s: str | None) -> int | None:
+    d = parse_ymd_safe(s) if s else None
+    return d.year if d else None
+
+def spans_future_year(start_s: str, end_s: str) -> bool:
+    y1, y2 = year_of(start_s), year_of(end_s)
+    if y1 is None or y2 is None:
+        return False
+    return max(y1, y2) > this_year()
+
+def spans_multiple_years(start_s: str, end_s: str) -> bool:
+    y1, y2 = year_of(start_s), year_of(end_s)
+    if y1 is None or y2 is None:
+        return False
+    return y1 != y2
+
+# 표준 타입: checkin / checkout / annual / halfday / off
+def normalize_action(v: str | None) -> str | None:
+    if not v:
+        return None
+    s = str(v).strip().lower()
+    mapping = {
+        "출근": "checkin", "퇴근": "checkout",
+        "연차": "annual", "반차": "halfday", "휴무": "off",
+        "checkin": "checkin", "checkout": "checkout",
+        "annual": "annual", "halfday": "halfday", "off": "off",
+    }
+    return mapping.get(s)
 
 # --- 관리자 여부 확인 ---
 def is_admin(user_id: str, client=None) -> bool:
@@ -227,16 +282,26 @@ def idemp_key(user_key: str, type_: str, date_str: str) -> str:
     return f"{(user_key or '').strip().lower()}|{type_.lower()}|{date_str}"
 
 # --- 중복 처리 방지 및 일일 1회 제한 적용 후 기록 추가 ---
-def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None, alt_user_key: str | None = None):
+def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=None, note_tag=None,
+                     alt_user_key: str | None = None, *, is_admin: bool = False):
     ds = (date_str or today_kst_ymd()).strip()
-    t = (type_ or "").strip().lower()
-    key = idemp_key(user_key, t, ds)
+    t  = (type_ or "").strip().lower()
 
+    # --- 과거 날짜 금지 정책 (최종 가드) ---
+    if t in ("annual", "halfday", "off", "checkin", "checkout"):
+        if not (is_admin and ALLOW_BACKDATE_ADMIN):
+            if is_past_ymd(ds):
+                raise RuntimeError("지난 날짜에는 등록할 수 없습니다.")
+
+    key = idemp_key(user_key, t, ds)
+    
     with _inflight_lock:
         if key in _inflight:
             raise RuntimeError("중복 처리 중입니다. 잠시 후 다시 시도하세요.")
         _inflight.add(key)
+
     try:
+        # 기본 중복 규칙
         if t in ("checkin", "checkout") and already_logged(user_key, t, ds, alt_user_key=alt_user_key):
             raise RuntimeError(f"이미 오늘 {t} 기록이 있습니다.")
         if t == "annual" and already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
@@ -247,37 +312,48 @@ def guard_and_append(user_key, user_name, type_, note="", date_str="", by_user=N
         if t == "off" and already_logged(user_key, "off", ds, alt_user_key=alt_user_key):
             raise RuntimeError("이미 해당 날짜에 휴무 기록이 있습니다.")
 
+        # --- 상호배타 규칙 추가 ---
+        if t == "halfday":
+            # 그 날짜에 '연차'가 이미 있으면 반차 금지
+            if already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
+                raise RuntimeError("해당 날짜에 이미 연차가 있어 반차를 등록할 수 없습니다.")
+        if t == "annual":
+            # 그 날짜에 반차(오전/오후 중 하나라도)가 있으면 연차 금지
+            if any_halfday_on_date(user_key, ds, alt_user_key=alt_user_key):
+                raise RuntimeError("해당 날짜에 이미 반차가 있어 연차를 등록할 수 없습니다.")
+
         def _do():
-            # 타입/날짜 최종 정규화해서 기록
             return append_log(user_key, user_name, t, note=note, date_str=ds, by_user=by_user)
+
         return with_retry(_do)
+
     finally:
         with _inflight_lock:
             _inflight.discard(key)
 
+
 # --- 중복 기록 검사 및 메시지 생성 ---
-def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None) -> str | None:
-    """
-    폼 제출 단계에서 사전 중복 체크용.
-    guard_and_append와 동일 규칙을 사용해야 한다.
-    """
+def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: str | None, alt_user_key: str | None = None) -> str | None:
     ds = (date_str or today_kst_ymd()).strip()
     t = action.lower()
 
-    if t in {"checkin", "checkout"} and already_logged(user_key, t, ds, None):
+    if t in {"checkin","checkout"} and already_logged(user_key, t, ds, alt_user_key=alt_user_key):
         return f"이미 오늘 {t} 기록이 있습니다."
-
-    if t == "annual" and already_logged(user_key, "annual", ds, None):
-        return "이미 해당 날짜에 연차 기록이 있습니다."
-
-    if t == "halfday" and already_logged(user_key, "halfday", ds, note_tag=half_period):
-        tag_txt = "오전" if half_period == "am" else "오후"
-        return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
-
-    if t == "off" and already_logged(user_key, "off", ds, None):
+    if t == "annual":
+        if already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
+            return "이미 해당 날짜에 연차 기록이 있습니다."
+        if any_halfday_on_date(user_key, ds, alt_user_key=alt_user_key):
+            return "해당 날짜에 이미 반차가 있어 연차를 등록할 수 없습니다."
+    if t == "halfday":
+        if already_logged(user_key, "halfday", ds, note_tag=half_period, alt_user_key=alt_user_key):
+            tag_txt = "오전" if half_period == "am" else "오후"
+            return f"이미 해당 날짜 {tag_txt} 반차 기록이 있습니다."
+        if already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
+            return "해당 날짜에 이미 연차가 있어 반차를 등록할 수 없습니다."
+    if t == "off" and already_logged(user_key, "off", ds, alt_user_key=alt_user_key):
         return "이미 해당 날짜에 휴무 기록이 있습니다."
-
     return None
+
 
 # =========================================================
 # 관리자 감사 로그
@@ -397,174 +473,174 @@ def 근태_action_change(ack, body, client):
 # ---------- 제출 처리 ----------
 @app.view("attendance_submit")
 def 근태_submit(ack, body, view, client, logger):
-    vals = (view.get("state") or {}).get("values") or {}
-    errors = {}
+    acked = False
+    def ack_errors(errors: dict):
+        nonlocal acked
+        if not acked:
+            ack(response_action="errors", errors=errors); acked = True
+        else:
+            try:
+                uid = body["user"]["id"]
+                client.chat_postEphemeral(channel=uid, user=uid,
+                    text="\n".join(f"{k}: {v}" for k, v in errors.items()))
+            except Exception:
+                pass
+    def ack_ok():
+        nonlocal acked
+        if not acked:
+            ack(); acked = True
 
-    # ---------- 1) 액션 ----------
-    action = None
     try:
-        sel = (vals.get("action_b", {}).get("action", {}) or {}).get("selected_option")
-        if sel:
-            action = sel.get("value")  # annual | halfday | off
-    except Exception:
-        pass
+        vals = (view.get("state") or {}).get("values") or {}
+        errors = {}
 
-    if not action:
-        errors["action_b"] = "항목을 선택하세요."
-
-    # ---------- 2) 날짜 ----------
-    def get_date(block_id, action_id):
-        try:
-            return (vals.get(block_id, {}).get(action_id, {}) or {}).get("selected_date")
-        except Exception:
-            return None
-
-    date_start = get_date("date_start_b", "date_start")
-    date_end = get_date("date_end_b", "date_end")
-
-    # ---------- 3) 메모 ----------
-    try:
+        # 1) 파싱
+        action_raw = (vals.get("action_b", {}).get("action", {}) or {}).get("selected_option", {}).get("value")
+        action = normalize_action(action_raw)
+        def get_date(b,a):
+            try: return (vals.get(b, {}).get(a, {}) or {}).get("selected_date")
+            except: return None
+        date_start = get_date("date_start_b","date_start")
+        date_end   = get_date("date_end_b","date_end")
         note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
-    except Exception:
-        note = ""
+        half_period = None
+        if action == "halfday":
+            hp = (vals.get("half_b", {}).get("half_period", {}) or {}).get("selected_option")
+            if hp: half_period = hp.get("value")  # "am"/"pm"
 
-    # ---------- 4) 반차 구분 ----------
-    half_period = None
-    if action == "halfday":
+        # 2) 형식 검증(폼 에러)
+        if not action:
+            errors["action_b"] = "항목을 선택하세요."
+        if action in ("annual","halfday","off") and not date_start:
+            errors["date_start_b"] = "시작일을 선택하세요."
+        if action in ("annual","off") and date_start and date_end:
+            ds, de = parse_ymd_safe(date_start), parse_ymd_safe(date_end)
+            if ds and de and de < ds:
+                errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
+        if action == "halfday" and not half_period:
+            errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
+        if errors: return ack_errors(errors)
+
+        # 3) 연도/과거일 정책(폼 에러)
+        # (여기서 only 연도/과거일만 체크)
+        thisy = today_kst_date().year
+        if not ALLOW_FUTURE_YEAR_USER:
+            y0 = parse_ymd_safe(date_start).year if date_start else None
+            y1 = parse_ymd_safe(date_end).year if (date_end or date_start) else y0
+            if action == "halfday":
+                if y0 and y0 > thisy:
+                    errors["date_start_b"] = f"{thisy}년 이후 날짜는 등록할 수 없습니다."
+            elif action in ("annual","off"):
+                if y0 and y1:
+                    if max(y0,y1) > thisy:
+                        errors["date_start_b"] = f"{thisy}년 이후 날짜가 포함되어 있습니다."
+                    elif y0 != y1:
+                        errors["date_start_b"] = "두 해에 걸친 기간은 나눠서 등록하세요."
+        if not ALLOW_BACKDATE_USER:
+            if action == "halfday":
+                if date_start and is_past_ymd(date_start):
+                    errors["date_start_b"] = "지난 날짜에는 반차를 등록할 수 없습니다."
+            elif action in ("annual","off"):
+                if date_start and not date_end and is_past_ymd(date_start):
+                    errors["date_start_b"] = "지난 날짜에는 등록할 수 없습니다."
+                elif date_start and date_end and contains_past_ymd(date_start, date_end):
+                    errors["date_start_b"] = "지난 날짜가 포함되어 있습니다. 오늘 이후로만 선택하세요."
+        # 시트 존재
+        missing = [n for n in ("logs","balances","schedule_weekly","holidays") if not sheet_exists(n)]
+        if missing:
+            errors["action_b"] = "시트가 없습니다: " + ", ".join(missing)
+        if errors: return ack_errors(errors)
+
+        # 4) 여기서 즉시 ACK (이후 I/O OK)
+        ack_ok()
+
+        # 5) 사용자 정보
+        uid  = body["user"]["id"]
+        ukey = safe_user_key(client, uid)
+        uname= safe_user_name(client, uid)
+
+        saved, failed, skips = [], [], []
+
+        if action == "halfday":
+            ds = date_start
+            note_final = note + (" (오전)" if half_period=="am" else " (오후)")
+            try:
+                guard_and_append(ukey, uname, "halfday",
+                    note=note_final, date_str=ds, by_user=ukey,
+                    note_tag=half_period, alt_user_key=uid)
+                saved.append(ds)
+            except Exception as e:
+                failed.append((ds, human_error(e)))
+
+        elif action == "annual":
+            # 잔여·스킵 계산은 ACK 이후 수행 → 초과면 에페메럴로만 안내하고 종료
+            try:
+                savables, skips = resolve_annual_savables(ukey, date_start, date_end or date_start, alt_user_key=uid)
+                need_days = len(savables)
+                current_left = update_balance_for_user(ukey, uname)
+            except Exception as e:
+                client.chat_postEphemeral(channel=uid, user=uid, text="잔여/시트 계산 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+                return
+
+            if need_days > current_left:
+                msg = f"선택한 기간 중 실제 기록 대상 {need_days}일이 잔여 {current_left:g}일을 초과하여 등록되지 않았습니다."
+                if skips:
+                    msg += f"\n*스킵됨(사유)*\n" + "\n".join(f"- {d} : {m}" for d, m in skips)
+                client.chat_postEphemeral(channel=uid, user=uid, text=msg)
+                return
+
+            # 기록
+            for ds in savables:
+                try:
+                    guard_and_append(ukey, uname, "annual",
+                        note=note, date_str=ds, by_user=ukey, alt_user_key=uid)
+                    saved.append(ds)
+                except Exception as e:
+                    failed.append((ds, human_error(e)))
+
+        elif action == "off":
+            for ds in iter_dates(date_start, date_end or date_start):
+                try:
+                    guard_and_append(ukey, uname, "off",
+                        note=note, date_str=ds, by_user=ukey, alt_user_key=uid)
+                    saved.append(ds)
+                except Exception as e:
+                    failed.append((ds, human_error(e)))
+        else:
+            ds = date_start or today_kst_ymd()
+            try:
+                guard_and_append(ukey, uname, action,
+                    note=note, date_str=ds, by_user=ukey, alt_user_key=uid)
+                saved.append(ds)
+            except Exception as e:
+                failed.append((ds, human_error(e)))
+
+        # 6) 결과 에페메럴
         try:
-            hp_sel = (vals.get("half_b", {}).get("half_period", {}) or {}).get("selected_option")
-            if hp_sel:
-                half_period = hp_sel.get("value")  # am / pm
+            ch = (json.loads(view.get("private_metadata") or "{}").get("channel_id")) or uid
+            def section(title, items):
+                if not items: return ""
+                if isinstance(items[0], tuple):
+                    body = "\n".join(f"- {d} : {m}" for d, m in items)
+                else:
+                    body = "\n".join(f"- {d}" for d in items)
+                return f"\n*{title}*\n{body}"
+            title = {"annual":"연차 등록 결과","halfday":"반차 등록 결과","off":"휴무 등록 결과"}.get(action,"처리 결과")
+            period = f" ({date_start}" + (f" ~ {date_end}" if date_end and date_end!=date_start else "") + ")"
+            msg = f"*{title}*{period}" + section("저장됨", saved) + (section("스킵됨(사유)", skips) if action=="annual" else "") + section("실패함(오류)", failed)
+            client.chat_postEphemeral(channel=ch, user=uid, text=msg)
         except Exception:
             pass
 
-    # ---------- 5) 유저 정보 ----------
-    uid = body["user"]["id"]
-    ukey = safe_user_key(client, uid)
-    uname = safe_user_name(client, uid)
-
-    # ---------- 6) 기본 검증 (여기서는 "형식"만, 시트 접근 금지) ----------
-    if action in ("annual", "halfday", "off") and not date_start:
-        errors["date_start_b"] = "시작일을 선택하세요."
-
-    if action in ("annual", "off") and date_start and date_end:
-        ds = parse_ymd_safe(date_start)
-        de = parse_ymd_safe(date_end)
-        if ds and de and de < ds:
-            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
-
-    if action == "halfday" and not half_period:
-        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
-
-    # ---------- 7) 형식 에러 있으면: 폼 에러로 ack 후 종료 ----------
-    if errors:
-        ack(response_action="errors", errors=errors)
-        return
-
-    # ---------- 8) 여기서 즉시 ack (시트 I/O 이전) ----------
-    ack()
-
-    # ---------- 9) 실제 기록 (이제 느린 작업 가능) ----------
-    try:
-        if action == "halfday":
-            ds = date_start
-            note_final = note
-            if half_period == "am":
-                note_final += " (오전)"
-            elif half_period == "pm":
-                note_final += " (오후)"
-            guard_and_append(
-                ukey,
-                uname,
-                "halfday",
-                note=note_final,
-                date_str=ds,
-                by_user=ukey,
-                note_tag=half_period,
-            )
-
-        elif action in ("annual", "off"):
-            if not date_end:
-                date_end = date_start
-
-            # annual 은 평일/영업일만 기록, off는 원하는 정책에 맞게 선택
-            if action == "annual":
-                dates_iter = iter_business_dates(date_start, date_end)
-            else:
-                # 휴무(off)는 보통 잔여 차감 대상이 아니므로 전체 날짜 기록해도 됨
-                dates_iter = iter_dates(date_start, date_end)
-
-            for ds in dates_iter:
-                guard_and_append(
-                    ukey,
-                    uname,
-                    action,          # "annual" or "off"
-                    note=note,
-                    date_str=ds,
-                    by_user=ukey,
-                )
-
-        else:
-            # action을 checkin/checkout으로 확장할 경우용
-            ds = date_start or today_kst_ymd()
-            guard_and_append(
-                ukey,
-                uname,
-                action,
-                note=note,
-                date_str=ds,
-                by_user=ukey,
-                
-            )
-
     except Exception as e:
-        # 중복/기타 오류: 모달은 이미 닫혔으므로 에페메럴/DM로만 안내
-        logger.exception("attendance_submit processing error")
-        msg = human_error(e)
+        logger.exception("attendance_submit fatal")
+        try: ack_ok()
+        except Exception: pass
         try:
-            meta = json.loads(view.get("private_metadata") or "{}")
-            ch = meta.get("channel_id") or uid
-            client.chat_postEphemeral(channel=ch, user=uid, text=msg)
+            uid = body["user"]["id"]
+            client.chat_postMessage(channel=uid, text=human_error(e))
         except Exception:
-            # 에페메럴 실패 시 DM 시도
-            try:
-                client.chat_postMessage(channel=uid, text=msg)
-            except Exception:
-                pass
-        return
-
-    # ---------- 10) 성공 에페메럴 안내 ----------
-    try:
-        meta = json.loads(view.get("private_metadata") or "{}")
-        ch = meta.get("channel_id") or uid
-
-        if action == "halfday":
-            label = "반차"
-            if half_period == "am":
-                label = "오전 반차"
-            elif half_period == "pm":
-                label = "오후 반차"
-            client.chat_postEphemeral(
-                channel=ch,
-                user=uid,
-                text=f"{label} {date_start} 등록 완료",
-            )
-
-        elif action == "annual":
-            if date_end and date_end != date_start:
-                txt = f"연차 {date_start} ~ {date_end} 등록 완료"
-            else:
-                txt = f"연차 {date_start} 등록 완료"
-            client.chat_postEphemeral(channel=ch, user=uid, text=txt)
-
-        elif action == "off":
-            if date_end and date_end != date_start:
-                txt = f"휴무 {date_start} ~ {date_end} 등록 완료"
-            else:
-                txt = f"휴무 {date_start} 등록 완료"
-            client.chat_postEphemeral(channel=ch, user=uid, text=txt)
-    except Exception:
-        pass
+            pass
 
 
 # =========================================================
@@ -657,14 +733,47 @@ def build_admin_view(selected_action: str | None = None, preserved: dict | None 
 # --- 커맨드: /근태관리 ---
 # 호출부
 @app.command("/근태관리")
-def admin_modal(ack, body, client, respond):
+def admin_modal(ack, body, client):
     ack()
-    uid = body["user_id"]
-    if not is_admin(uid, client):
-        respond("권한 없음.")
-        return
-    view = build_admin_view(selected_action=None, preserved={})
-    client.views_open(trigger_id=body["trigger_id"], view=view)
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type":"modal", "callback_id":"admin_attendance_submit",
+            "private_metadata": json.dumps({"channel_id": body.get("channel_id")}),
+            "title":{"type":"plain_text","text":"관리자 근태 등록"},
+            "submit":{"type":"plain_text","text":"저장"},
+            "close":{"type":"plain_text","text":"취소"},
+            "blocks":[
+                # 대상자 선택 (users_select)
+                {"type":"input","block_id":"u_b","label":{"type":"plain_text","text":"대상자"},
+                 "element":{"type":"users_select","action_id":"u"}},
+                # 액션
+                {"type":"input","block_id":"action_b","label":{"type":"plain_text","text":"항목"},
+                 "element":{"type":"static_select","action_id":"action","options":[
+                    {"text":{"type":"plain_text","text":"연차"},"value":"annual"},
+                    {"text":{"type":"plain_text","text":"반차"},"value":"halfday"},
+                    {"text":{"type":"plain_text","text":"휴무"},"value":"off"},
+                 ]}},
+                # 반차 오전/오후
+                {"type":"input","block_id":"half_b","optional":True,"label":{"type":"plain_text","text":"반차 구분"},
+                 "element":{"type":"radio_buttons","action_id":"half_period","options":[
+                   {"text":{"type":"plain_text","text":"오전"},"value":"am"},
+                   {"text":{"type":"plain_text","text":"오후"},"value":"pm"},
+                 ]}},
+                # 기간
+                {"type":"input","block_id":"date_start_b","label":{"type":"plain_text","text":"시작일"},
+                 "element":{"type":"datepicker","action_id":"date_start"}},
+                {"type":"input","block_id":"date_end_b","optional":True,"label":{"type":"plain_text","text":"종료일"},
+                 "element":{"type":"datepicker","action_id":"date_end"}},
+                # 주말 포함 옵션(결정 2번 참조)
+                {"type":"input","block_id":"opt_biz","optional":True,"label":{"type":"plain_text","text":"옵션"},
+                 "element":{"type":"checkboxes","action_id":"biz_opt","options":[
+                   {"text":{"type":"plain_text","text":"주말/공휴일 포함"},"value":"include_weekends"}
+                 ]}},
+                {"type":"input","block_id":"note_b","optional":True,"label":{"type":"plain_text","text":"메모"},
+                 "element":{"type":"plain_text_input","action_id":"note"}}
+            ]}
+    )
     
 @app.block_action("action")
 def admin_action_change(ack, body, client):
@@ -681,112 +790,123 @@ def admin_action_change(ack, body, client):
     
 # --- 제출: admin_attendance_submit ---
 @app.view("admin_attendance_submit")
-def admin_submit(ack, body, view, client):
-    vals = view["state"]["values"]
+def admin_submit(ack, body, view, client, logger):
+    acked = False
+    def ack_errors(errors):
+        nonlocal acked
+        if not acked: ack(response_action="errors", errors=errors); acked=True
 
-    target_uid = vals["target_b"]["target"]["selected_user"]
-    action = vals["action_b"]["action"]["selected_option"]["value"]  # checkin|checkout|annual|halfday|off
-
-    date_start = vals["date_start_b"]["date_start"].get("selected_date")
-    date_end = vals.get("date_end_b", {}).get("date_end", {}).get("selected_date")
-    note = (vals.get("note_b", {}).get("note", {}).get("value") or "").strip()
-
+    # 1) 파싱
+    vals = (view.get("state") or {}).get("values") or {}
+    get = lambda b,a: (vals.get(b, {}).get(a, {}) or {})
+    action = normalize_action(get("action_b","action").get("selected_option",{}).get("value"))
+    target_uid = get("u_b","u").get("selected_user")
+    date_start = get("date_start_b","date_start").get("selected_date")
+    date_end   = get("date_end_b","date_end").get("selected_date")
+    note = (get("note_b","note").get("value") or "").strip()
     half_period = None
-    if action == "halfday" and "half_b" in vals:
-        hp = vals["half_b"]["half_period"].get("selected_option")
-        half_period = hp["value"] if hp else None
+    if action=="halfday":
+        hp = get("half_b","half_period").get("selected_option")
+        if hp: half_period = hp.get("value")  # "am"/"pm"
+    include_weekends = any(o.get("value")=="include_weekends"
+                           for o in (get("opt_biz","biz_opt").get("selected_options") or []))
 
-    admin_uid = body["user"]["id"]
-    admin_key = safe_user_key(client, admin_uid)
-    target_key = safe_user_key(client, target_uid)
-    target_name = safe_user_name(client, target_uid)
+    # 2) 형식 검증
+    errors={}
+    if not target_uid: errors["u_b"]="대상자를 선택하세요."
+    if not action: errors["action_b"]="항목을 선택하세요."
+    if action in ("annual","halfday","off") and not date_start:
+        errors["date_start_b"]="시작일을 선택하세요."
+    if action in ("annual","off") and date_start and date_end:
+        ds,de = parse_ymd_safe(date_start), parse_ymd_safe(date_end)
+        if ds and de and de<ds: errors["date_end_b"]="종료일이 시작일보다 앞일 수 없습니다."
+    if action=="halfday" and not half_period:
+        errors["half_b"]="반차는 오전/오후 선택이 필요합니다."
+    if errors: return ack_errors(errors)
 
-    errors = {}
+    # 3) 연도/과거일 정책(관리자 플래그 적용)
+    def _safe_date(s): return parse_ymd_safe(s) if s else None
+    def _safe_year(s): d=_safe_date(s); return d.year if d else None
+    thisy=today_kst_date().year
+    y0=_safe_year(date_start); y1=_safe_year(date_end) or y0
+    if not ALLOW_FUTURE_YEAR_ADMIN:
+        if action=="halfday" and y0 and y0>thisy: errors["date_start_b"]=f"{thisy}년 이후 날짜는 등록할 수 없습니다."
+        elif action in ("annual","off") and y0 and y1:
+            if max(y0,y1)>thisy: errors["date_start_b"]=f"{thisy}년 이후 날짜가 포함되어 있습니다."
+            elif y0!=y1: errors["date_start_b"]="두 해에 걸친 기간은 나눠서 등록하세요."
+    if not ALLOW_BACKDATE_ADMIN:
+        d0=_safe_date(date_start); d1=_safe_date(date_end) or d0; today=today_kst_date()
+        if action=="halfday" and d0 and d0<today: errors["date_start_b"]="지난 날짜에는 반차를 등록할 수 없습니다."
+        elif action in ("annual","off") and d0 and d1:
+            if d0==d1 and d0<today: errors["date_start_b"]="지난 날짜에는 등록할 수 없습니다."
+            elif d1<today or (d0<today<=d1): errors["date_start_b"]="지난 날짜가 포함되어 있습니다."
+    # 시트 존재
+    miss=[n for n in ("logs","balances","schedule_weekly","holidays") if not sheet_exists(n)]
+    if miss: errors["action_b"]="시트가 없습니다: "+", ".join(miss)
+    if errors: return ack_errors(errors)
 
-    # 권한 검증
-    if not is_admin(admin_uid, client):
-        errors["action_b"] = "관리자 권한이 없습니다."
-
-    # 필수 검증
-    if action in ("annual", "halfday", "off") and not date_start:
-        errors["date_start_b"] = "시작일을 선택하세요."
-
-    if action in ("annual", "off") and date_start and date_end:
-        if parse_ymd_safe(date_end) and parse_ymd_safe(date_start) and parse_ymd_safe(date_end) < parse_ymd_safe(date_start):
-            errors["date_end_b"] = "종료일이 시작일보다 앞일 수 없습니다."
-
-    if action == "halfday" and not half_period:
-        errors["half_b"] = "반차는 오전/오후 선택이 필요합니다."
-
-    # 중복 사전검증
-    if not errors and date_start:
-        if action in ("annual", "off") and date_end:
-            dates = iter_dates(date_start, date_end)
-        else:
-            dates = [date_start]
-
-        for ds in dates:
-            dup = dup_error_msg_for(action, target_key, ds, half_period)
-            if dup:
-                if action in ("annual", "off"):
-                    errors["date_start_b"] = dup
-                elif action == "halfday":
-                    key = "half_b" if "반차" in dup or "오전" in dup or "오후" in dup else "date_start_b"
-                    errors[key] = dup
-                else:
-                    errors["action_b"] = dup
-                break
-
-    if errors:
-        ack(response_action="errors", errors=errors)
-        try:
-            record_admin_request(admin_key, target_key, action, date_start or "", note, "fail", "; ".join(errors.values()))
-        except Exception:
-            pass
-        return
-
+    # 4) 여기서 ACK (이후 I/O)
     ack()
 
-    # 실제 기록
-    try:
-        if action == "halfday":
-            ds = date_start
-            note_final = note
-            if half_period == "am":
-                note_final += " (오전)"
-            elif half_period == "pm":
-                note_final += " (오후)"
-            guard_and_append(target_key, target_name, "halfday",
-                             note=note_final, date_str=ds,
-                             by_user=admin_key, note_tag=half_period, alt_user_key=target_uid)
-            record_admin_request(admin_key, target_key, "halfday", ds, note_final, "ok", "")
-        elif action in ("annual", "off"):
-            if not date_end:
-                date_end = date_start
-            if action == "annual":
-                dates_iter = iter_business_dates(date_start, date_end)
-            else:
-                dates_iter = iter_dates(date_start, date_end)
-            for ds in dates_iter:
-                guard_and_append(target_key, target_name, action,
-                                note=note, date_str=ds, by_user=admin_key,
-                                alt_user_key=target_uid)
+    # 5) 대상자 키/이름
+    target_key = safe_user_key(client, target_uid)
+    target_name= safe_user_name(client, target_uid)
+    admin_uid  = body["user"]["id"]
+    admin_key  = safe_user_key(client, admin_uid)
 
-        else:  # checkin / checkout
-            ds = date_start or today_kst_ymd()
-            guard_and_append(target_key, target_name, action,
-                             note=note, date_str=ds, by_user=admin_key, alt_user_key=target_uid)
-            record_admin_request(admin_key, target_key, action, ds, note, "ok", "")
-        # 관리자에게 결과 안내
-        client.chat_postMessage(
-            channel=admin_uid,
-            text=f"[관리자 대리입력] {target_name} {action} 처리 완료",
-        )
-    except Exception as e:
-        record_admin_request(admin_key, target_key, action, date_start or "", note, "fail", str(e))
-        client.chat_postMessage(
-            channel=admin_uid,
-            text=f"[관리자 대리입력 실패] {human_error(e)}",
+    saved, failed, skips = [], [], []
+
+    try:
+        if action=="halfday":
+            ds=date_start
+            note_final = note + (" (오전)" if half_period=="am" else " (오후)")
+            guard_and_append(target_key, target_name, "halfday",
+                             note=note_final, date_str=ds, by_user=admin_key,
+                             note_tag=half_period, alt_user_key=target_uid, is_admin=True)
+            saved.append(ds)
+
+        elif action=="annual":
+            if not date_end: date_end=date_start
+            # 주말 포함 옵션 반영
+            if include_weekends:
+                dates = list(iter_dates(date_start, date_end))
+            else:
+                # 기존 정책 유지: 사업일만
+                # + 반차 충돌/중복/연차중복 체크는 guard에서 처리되며, 실패는 failed에 기록
+                dates = [d for d in iter_dates(date_start, date_end) if is_business_day(parse_ymd_safe(d))]
+
+            for ds in dates:
+                try:
+                    # 상호배타/중복/별칭 규칙 동일 + 관리자 플래그
+                    guard_and_append(target_key, target_name, "annual",
+                                     note=note, date_str=ds, by_user=admin_key,
+                                     alt_user_key=target_uid, is_admin=True)
+                    saved.append(ds)
+                except Exception as e:
+                    failed.append((ds, human_error(e)))
+
+        elif action=="off":
+            for ds in iter_dates(date_start, date_end or date_start):
+                try:
+                    guard_and_append(target_key, target_name, "off",
+                                     note=note, date_str=ds, by_user=admin_key,
+                                     alt_user_key=target_uid, is_admin=True)
+                    saved.append(ds)
+                except Exception as e:
+                    failed.append((ds, human_error(e)))
+    finally:
+        # 결과 에페메럴
+        ch = (json.loads(view.get("private_metadata") or "{}").get("channel_id")) or admin_uid
+        def section(title, items):
+            if not items: return ""
+            if isinstance(items[0], tuple): body="\n".join(f"- {d} : {m}" for d,m in items)
+            else: body="\n".join(f"- {d}" for d in items)
+            return f"\n*{title}*\n{body}"
+        client.chat_postEphemeral(
+            channel=ch, user=admin_uid,
+            text=(f"*관리자 {('연차' if action=='annual' else '반차' if action=='halfday' else '휴무')} 등록 결과* "
+                  f"({date_start}" + (f" ~ {date_end}" if date_end and date_end!=date_start else "") + ")\n"
+                  + section("저장됨", saved) + section("실패함(오류)", failed))
         )
 
 # =========================================================
@@ -809,13 +929,6 @@ def to_float(v, default=0.0):
         return default
 
 def logs_usage_since(user_key: str, since_date: dt.date | None = None, year: int | None = None):
-    """
-    logs에서 해당 사용자 연차/반차 사용량 집계.
-    annual: 1.0, halfday: 0.5
-    since_date가 있으면 그 날짜 이상만.
-    year가 있으면 해당 연도만.
-    둘 다 주어지면 AND 조건.
-    """
     ws = get_ws("logs")
     vals = ws.get_all_values()
     if not vals:
@@ -823,40 +936,57 @@ def logs_usage_since(user_key: str, since_date: dt.date | None = None, year: int
 
     head = [h.strip().lower() for h in vals[0]]
     idx = {h: i for i, h in enumerate(head)}
-
     iu = idx.get("user_key") or idx.get("user_id")
     it = idx.get("type")
     idate = idx.get("date")
-
     if iu is None or it is None or idate is None:
         return 0.0, 0.0
 
     target = (user_key or "").strip().lower()
-    annual_used = 0.0
-    half_used = 0.0
+    dates_annual = set()
+    half_count = {}
 
+    def ok_date(d: dt.date) -> bool:
+        if since_date and d < since_date:
+            return False
+        if year and d.year != year:
+            return False
+        # 평일/휴일 필터 (원한다면 사업일만 차감)
+        return is_business_day(d)
+
+    # 1차 스캔: 연차 날짜 수집
     for r in vals[1:]:
         if iu >= len(r) or it >= len(r) or idate >= len(r):
             continue
-
         uk = (r[iu] or "").strip().lower()
         if uk != target:
             continue
-
         t = (r[it] or "").strip().lower()
         d = parse_ymd_safe((r[idate] or "").strip())
-        if not d:
+        if not d or not ok_date(d):
             continue
-
-        if since_date and d < since_date:
-            continue
-        if year and d.year != year:
-            continue
-
         if t == "annual":
-            annual_used += 1.0
-        elif t == "halfday":
-            half_used += 0.5
+            dates_annual.add(d.isoformat())
+
+    # 2차 스캔: 반차 카운트 (단, 같은 날 연차 있으면 무시)
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+        uk = (r[iu] or "").strip().lower()
+        if uk != target:
+            continue
+        t = (r[it] or "").strip().lower()
+        d = parse_ymd_safe((r[idate] or "").strip())
+        if not d or not ok_date(d):
+            continue
+        if t == "halfday" and d.isoformat() not in dates_annual:
+            half_count[d.isoformat()] = half_count.get(d.isoformat(), 0) + 1
+
+    annual_used = float(len(dates_annual))
+    # 같은 날 반차 2개라도 1.0까지만 인정
+    half_used = 0.0
+    for _, c in half_count.items():
+        half_used += min(1.0, 0.5 * c)
 
     return annual_used, half_used
 
@@ -1795,6 +1925,129 @@ def logs_usage_since(user_key: str, since_date: dt.date | None = None, year: int
             half_used += 0.5
 
     return annual_used, half_used
+
+def any_halfday_on_date(user_key: str, date_str: str, alt_user_key: str | None = None) -> bool:
+    ws = get_ws("logs")
+    vals = ws.get_all_values()
+    if not vals:
+        return False
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    if iu is None or it is None or idate is None:
+        return False
+
+    uk_primary = (user_key or "").strip().lower()
+    uk_alt = (alt_user_key or "").strip().lower()
+    want_date = (date_str or "").strip()
+
+    def same_user(v):
+        v = (v or "").strip().lower()
+        return v == uk_primary or (uk_alt and v == uk_alt)
+
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+        if not same_user(r[iu]):
+            continue
+        if (r[it] or "").strip().lower() != "halfday":
+            continue
+        if (r[idate] or "").strip() != want_date:
+            continue
+        return True
+    return False
+
+def count_halfday_on_date(user_key: str, date_str: str, alt_user_key: str | None = None) -> int:
+    ws = get_ws("logs")
+    vals = ws.get_all_values()
+    if not vals:
+        return 0
+    head = [h.strip().lower() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(head)}
+    iu = idx.get("user_key") or idx.get("user_id")
+    it = idx.get("type")
+    idate = idx.get("date")
+    if iu is None or it is None or idate is None:
+        return 0
+
+    uk_primary = (user_key or "").strip().lower()
+    uk_alt = (alt_user_key or "").strip().lower()
+    want_date = (date_str or "").strip()
+
+    def same_user(v):
+        v = (v or "").strip().lower()
+        return v == uk_primary or (uk_alt and v == uk_alt)
+
+    c = 0
+    for r in vals[1:]:
+        if iu >= len(r) or it >= len(r) or idate >= len(r):
+            continue
+        if not same_user(r[iu]):
+            continue
+        if (r[it] or "").strip().lower() != "halfday":
+            continue
+        if (r[idate] or "").strip() != want_date:
+            continue
+        c += 1
+    return c
+
+def explain_skip_for_annual(user_key: str, ds: str, *, alt_user_key: str | None = None) -> str | None:
+    """
+    annual 제출 시, 해당 날짜 ds가 왜 스킵되는지 사유 문자열을 반환.
+    사유가 없으면 None (즉, 저장 가능).
+    """
+    d = parse_ymd_safe(ds)
+    if not d:
+        return "유효하지 않은 날짜 형식입니다."
+
+    # 주말/공휴일 정책: 평일만 기록한다면 아래 두 줄 유지
+    if not is_business_day(d):
+        return "주말/공휴일은 연차 기록 대상이 아닙니다."
+
+    # 상호배타: 해당 날짜에 반차가 하나라도 있으면 연차 금지
+    if any_halfday_on_date(user_key, ds, alt_user_key=alt_user_key):
+        return "해당 날짜에 반차가 있어 연차를 등록할 수 없습니다."
+
+    # 중복: 같은 날짜 연차 이미 있음
+    if already_logged(user_key, "annual", ds, alt_user_key=alt_user_key):
+        return "이미 해당 날짜에 연차 기록이 있습니다."
+
+    return None  # 저장 가능
+
+# --- 연차 기간 제출 시, 저장 가능한 날짜들과 스킵(사유) 목록 반환 ---
+def resolve_annual_savables(user_key: str, start_s: str, end_s: str, *, alt_user_key: str | None = None):
+    """
+    연차 기간 제출 시, 저장 가능한 날짜들과 스킵(사유) 목록을 돌려준다.
+    반환: (savable_dates: list[str], skips: list[tuple[str, str]])
+    """
+    dates_all = list(iter_dates(start_s, end_s))
+    savable, skips = [], []
+    for ds in dates_all:
+        reason = explain_skip_for_annual(user_key, ds, alt_user_key=alt_user_key)
+        if reason:
+            skips.append((ds, reason))
+        else:
+            savable.append(ds)
+    return savable, skips
+
+def today_kst_date() -> dt.date:
+    return dt.datetime.now(KST).date()
+
+def is_past_ymd(s: str) -> bool:
+    d = parse_ymd_safe(s)
+    if not d:
+        return False
+    return d < today_kst_date()
+
+def contains_past_ymd(start_s: str, end_s: str) -> bool:
+    ds = parse_ymd_safe(start_s); de = parse_ymd_safe(end_s)
+    if not ds or not de:
+        return False
+    today = today_kst_date()
+    # 전부 과거거나, 일부라도 과거 포함
+    return de < today or ds < today <= de or ds < today and de >= ds
 
 
 if __name__ == "__main__":
