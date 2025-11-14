@@ -20,7 +20,6 @@ logs = sh.worksheet("logs")
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 KST = pytz.timezone("Asia/Seoul")
 
-
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$") # YYYY-MM-DD
 
 ISO_WEEK_RE = re.compile(r"^\d{4}-W\d{2}$") # YYYY-Www
@@ -131,6 +130,10 @@ def safe_user_name(client, slack_user_id: str) -> str:
         return slack_user_id
     
 # --- 시간/날짜 ------------------------------------------------------------
+
+# 유틸 영역
+def now_kst_iso() -> str:
+    return dt.datetime.now(KST).isoformat(timespec="seconds")
 
 # --- 오늘 KST 날짜 문자열 ---    
 def today_kst_ymd():
@@ -1741,69 +1744,114 @@ def 스케줄_cmd(ack, body, respond, client):
 
     respond(text=render_week_table(week, r))
 
+# 권한 체크
+def require_admin(user_id: str, client) -> tuple[bool, str]:
+    # 기존 ADMIN_ID_SET / ADMIN_EMAIL_SET 등 조합
+    if is_admin(user_id, client):  # 이미 구현되어 있다면 사용
+        return True, ""
+    return False, "관리자만 사용할 수 있습니다."
+
+# 명세: admin_requests 헤더 권장
+# ts | admin_key | target_key | op | params | status | reason
+def log_admin_action(ts: str, admin_key: str, target_key: str, op: str, params: dict, status: str, reason: str=""):
+    ws = get_ws("admin_requests")
+    row = [ts, admin_key, target_key, op, json.dumps(params, ensure_ascii=False), status, reason]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
 # ---------- /잔여갱신 커맨드 + 모달 제출 핸들러 ----------
 @app.command("/잔여갱신")
-def 잔여갱신_modal(ack, body, client, respond):
+def 잔여갱신_modal(ack, body, client):
     ack()
-    if not is_admin(body["user_id"], client):
-        respond("권한 없음.")
-        return
-    today = dt.datetime.now(KST).date().isoformat()
-    client.views_open(trigger_id=body["trigger_id"],
-                      view=build_override_view(initial_left="", initial_date=today))
+    ok, why = require_admin(body["user_id"], client)
+    if not ok:
+        client.chat_postEphemeral(channel=body["channel_id"], user=body["user_id"], text=why); return
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+          "type":"modal","callback_id":"balances_update_submit",
+          "title":{"type":"plain_text","text":"잔여 갱신(관리자)"},
+          "submit":{"type":"plain_text","text":"저장"},
+          "close":{"type":"plain_text","text":"취소"},
+          "blocks":[
+            {"type":"input","block_id":"u_b","label":{"type":"plain_text","text":"대상자"},
+             "element":{"type":"users_select","action_id":"u"}},
+            {"type":"input","block_id":"total_b","optional":True,"label":{"type":"plain_text","text":"연차 총 일수(annual_total)"},
+             "element":{"type":"plain_text_input","action_id":"total"}},
+            {"type":"input","block_id":"override_b","optional":True,"label":{"type":"plain_text","text":"현재 기준선(override_left)"},
+             "element":{"type":"plain_text_input","action_id":"override"}},
+            {"type":"input","block_id":"note_b","optional":True,"label":{"type":"plain_text","text":"메모"},
+             "element":{"type":"plain_text_input","action_id":"note"}}
+          ]}
+    )
 
 # --- 잔여일수 재정의 모달 제출 핸들러 ---    
-@app.view("override_submit")
-def 잔여갱신_submit(ack, body, view, client):
-    vals = view["state"]["values"]
-    target_uid = vals["target_b"]["target"]["selected_user"]
-    left_str = (vals["left_b"]["left"]["value"] or "").strip()
-    from_date = vals["from_b"]["from_date"].get("selected_date")
-    note = (vals.get("note_b",{}).get("note",{}).get("value") or "").strip()
-    errors = {}
+@app.view("balances_update_submit")
+def 잔여갱신_submit(ack, body, view, client, logger):
+    ack()  # 빠른 ACK
+    admin_uid = body["user"]["id"]
+    ok, why = require_admin(admin_uid, client)
+    if not ok:
+        client.chat_postEphemeral(channel=admin_uid, user=admin_uid, text=why); return
+
+    vals=(view.get("state") or {}).get("values") or {}
+    get = lambda b,a: (vals.get(b, {}).get(a, {}) or {})
+    target_uid = get("u_b","u").get("selected_user")
+    total_s = (get("total_b","total").get("value") or "").strip()
+    override_s = (get("override_b","override").get("value") or "").strip()
+    note = (get("note_b","note").get("value") or "").strip()
+
+    ts = now_kst_iso()  # "YYYY-MM-DDTHH:MM:SS+09:00"
+    admin_key = safe_user_key(client, admin_uid)
+    target_key= safe_user_key(client, target_uid)
+    params = {"annual_total": total_s, "override_left": override_s, "note": note}
+
     try:
-        left_val = float(left_str)
-        if left_val < 0: errors["left_b"] = "0 이상 입력"
-    except Exception:
-        errors["left_b"] = "숫자 형식으로 입력"
-    if not from_date: errors["from_b"] = "기준 시작일 선택"
-    if errors:
-        ack(response_action="errors", errors=errors); return
-    ack()
+        ws = get_ws("balances")
+        vals_all = ws.get_all_values() or []
+        head = [h.strip().lower() for h in (vals_all[0] if vals_all else [])]
+        col = {h:i for i,h in enumerate(head)}
+        # 필수 컬럼 존재 보장
+        for h in ("user_key","annual_total","annual_used","half_used","annual_left","override_left","note"):
+            if h not in col:
+                raise RuntimeError(f"balances 시트에 '{h}' 컬럼이 없습니다.")
+        # 행 찾기/신규
+        rn=None
+        for i,r in enumerate(vals_all[1:], start=2):
+            if col["user_key"]<len(r) and (r[col["user_key"]] or "").strip().lower()==target_key.lower():
+                rn=i; row=r; break
+        if rn is None:
+            rn=len(vals_all)+1 if vals_all else 2
+            row=[""]*max(len(head),7)
+            if "user_key" in col: row[col["user_key"]]=target_key
 
-    # 키 해석
-    ukey = safe_user_key(client, target_uid)
-    uname = safe_user_name(client, target_uid)
+        # 숫자 파싱
+        def _num(s): 
+            try: return float(s)
+            except: return None
+        total_v = _num(total_s)
+        override_v = _num(override_s)
 
-    # balances upsert
-    ws, idx, rows, pos = get_balance_row_map()
-    rn = pos.get((ukey or "").strip().lower())
-    now_iso = dt.datetime.now(KST).isoformat(timespec="seconds")
-    # 보장 헤더
-    need = ["user_key","user_name","annual_total","annual_used","annual_left","half_used","override_left","override_from","last_admin_update","notes"]
-    if rows:
-        head = [h.strip().lower() for h in rows[0]]
-        if any(n not in head for n in ["user_key","user_name"]):
-            raise RuntimeError("balances 헤더에 user_key/user_name 필요")
-    # 새 행
-    row = [ukey, uname, "", "", "", "", str(left_val), from_date, now_iso, note]
-    if rn:
-        ws.update(
-            range_name=f"A{rn}:J{rn}",
-            values=[row],
-            value_input_option="USER_ENTERED",
+        # 값 적용
+        if total_v is not None: row[col["annual_total"]] = total_v
+        if override_v is not None: row[col["override_left"]] = override_v
+        if "note" in col: row[col["note"]] = note
+
+        # 시트 반영
+        ws.update(range_name=f"A{rn}:Z{rn}", values=[row], value_input_option="USER_ENTERED")
+
+        # 재계산 후 확인 응답
+        left = update_balance_for_user(target_key, safe_user_name(client, target_uid))
+        client.chat_postEphemeral(
+            channel=admin_uid, user=admin_uid,
+            text=f"잔여 갱신 완료: 현재 잔여 {left:g}일 (annual_total={total_v if total_v is not None else '변경 없음'}, "
+                 f"override_left={override_v if override_v is not None else '변경 없음'})"
         )
-    else:
-        # 헤더가 없다면 추가
-        if not rows:
-            ws.append_row(["user_key","user_name","annual_total","annual_used","annual_left","half_used","override_left","override_from","last_admin_update","notes"])
-        ws.append_row(row)
+        log_admin_action(ts, admin_key, target_key, "balances_update", params, "ok", "")
 
-    # 알림
-    try:
-        client.chat_postMessage(channel=body["user"]["id"], text=f"[잔여 기준선 설정] {uname}: {left_val}일, 기준일 {from_date}")
-    except Exception:
-        pass
+    except Exception as e:
+        reason = human_error(e)
+        client.chat_postEphemeral(channel=admin_uid, user=admin_uid, text=f"잔여 갱신 실패: {reason}")
+        log_admin_action(ts, admin_key, target_key, "balances_update", params, "fail", reason)
 
 # ---------- /잔여debug 커맨드 (개발용) ----------
 @app.command("/잔여debug")
