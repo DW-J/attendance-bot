@@ -362,18 +362,76 @@ def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: st
 # 관리자 감사 로그
 # ========================================================= 
 
-# --- 관리자 요청 기록 ---
-def record_admin_request(admin_key, target_key, action, date_str, note, result, error_msg=""):
+# --- admin_requests 시트 및 버전 확인 ---
+def ensure_admin_requests_sheet() -> tuple:
+    """admin_requests 시트 핸들 + 스키마 버전('v1' or 'v2') 반환.
+       없거나 비어 있으면 v2로 생성."""
     ws = get_ws("admin_requests")
-    vals = ws.get_all_values()
+    vals = ws.get_all_values() or []
     if not vals:
+        # v2로 생성
         ws.append_row(
-            ["ts_iso","admin_key","target_key","action","date","note","result","error"],
+            ["ts_iso","admin_key","target_key","action","params_json","status","reason"],
             value_input_option="USER_ENTERED",
         )
-    now = dt.datetime.now(KST).isoformat(timespec="seconds")
-    row = [now, admin_key, target_key, action, date_str or "", note or "", result, error_msg or ""]
-    with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+        return ws, "v2"
+
+    header = [h.strip().lower() for h in vals[0]]
+    hset = set(header)
+    if {"ts_iso","admin_key","target_key","action","params_json","status","reason"} <= hset:
+        return ws, "v2"
+    if {"ts_iso","admin_key","target_key","action","date","note","result","error"} <= hset:
+        return ws, "v1"
+
+    # 알 수 없는 헤더면 v2로 재정렬(권장) — 필요시 주석 해제
+    # ws.clear()
+    # ws.append_row(
+    #     ["ts_iso","admin_key","target_key","action","params_json","status","reason"],
+    #     value_input_option="USER_ENTERED",
+    # )
+    # return ws, "v2"
+
+    # 헤더 유지 + v1로 간주 (날짜/메모만 쓰는 보수 경로)
+    return ws, "v1"
+
+# --- 관리자 요청 시트 및 버전 확인 ---
+def log_admin_action(admin_key: str, target_key: str, action: str,
+                     params: dict, status: str, reason: str = "") -> None:
+    """권장 통합 로거. v1/v2 헤더 자동 감지 후 맞게 기록."""
+    ws, ver = ensure_admin_requests_sheet()
+    ts = dt.datetime.now(KST).isoformat(timespec="seconds")
+
+    if ver == "v2":
+        row = [
+            ts,
+            admin_key or "",
+            target_key or "",
+            action or "",
+            json.dumps(params or {}, ensure_ascii=False),
+            status or "",
+            reason or "",
+        ]
+        with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+    else:
+        # v1 매핑: date/note만 분해하고 나머지는 result/error에 반영
+        date = (params or {}).get("date", "") or ""
+        note = (params or {}).get("note", "") or ""
+        row = [
+            ts,
+            admin_key or "",
+            target_key or "",
+            action or "",
+            date,
+            note,
+            status or "",
+            reason or "",
+        ]
+        with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+
+# --- 관리자 요청 기록 ---
+def record_admin_request(admin_key, target_key, action, date_str, note, result, error_msg = ""):
+    params = {"date": date_str or "", "note": note or ""}
+    log_admin_action(admin_key, target_key, action, params, result, error_msg)
 
 # =========================================================
 # /근태 : 사용자 모달
@@ -526,28 +584,46 @@ def 근태_submit(ack, body, view, client, logger):
 
         # 3) 연도/과거일 정책(폼 에러)
         # (여기서 only 연도/과거일만 체크)
+        def _safe_date(s):
+            return parse_ymd_safe(s) if s else None
+
+        def _safe_year(s):
+            d = _safe_date(s)
+            return d.year if d else None
+
         thisy = today_kst_date().year
+        y0 = _safe_year(date_start)           # 시작일 연도(None 허용)
+        y1 = _safe_year(date_end) or y0       # 종료일 연도(없으면 시작일 연도 대체)
+
+        # 현재 연도 이후 금지 (사용자 정책 플래그 기준)
         if not ALLOW_FUTURE_YEAR_USER:
-            y0 = parse_ymd_safe(date_start).year if date_start else None
-            y1 = parse_ymd_safe(date_end).year if (date_end or date_start) else y0
             if action == "halfday":
                 if y0 and y0 > thisy:
                     errors["date_start_b"] = f"{thisy}년 이후 날짜는 등록할 수 없습니다."
-            elif action in ("annual","off"):
+            elif action in ("annual", "off"):
                 if y0 and y1:
-                    if max(y0,y1) > thisy:
+                    if max(y0, y1) > thisy:
                         errors["date_start_b"] = f"{thisy}년 이후 날짜가 포함되어 있습니다."
                     elif y0 != y1:
                         errors["date_start_b"] = "두 해에 걸친 기간은 나눠서 등록하세요."
+
+        # 과거 날짜 금지
         if not ALLOW_BACKDATE_USER:
+            d0 = _safe_date(date_start)
+            d1 = _safe_date(date_end) or d0
             if action == "halfday":
-                if date_start and is_past_ymd(date_start):
+                if d0 and d0 < today_kst_date():
                     errors["date_start_b"] = "지난 날짜에는 반차를 등록할 수 없습니다."
-            elif action in ("annual","off"):
-                if date_start and not date_end and is_past_ymd(date_start):
-                    errors["date_start_b"] = "지난 날짜에는 등록할 수 없습니다."
-                elif date_start and date_end and contains_past_ymd(date_start, date_end):
-                    errors["date_start_b"] = "지난 날짜가 포함되어 있습니다. 오늘 이후로만 선택하세요."
+            elif action in ("annual", "off"):
+                if d0 and d1:
+                    if d0 == d1:
+                        if d0 < today_kst_date():
+                            errors["date_start_b"] = "지난 날짜에는 등록할 수 없습니다."
+                    else:
+                        today = today_kst_date()
+                        if d1 < today or (d0 < today <= d1):
+                            errors["date_start_b"] = "지난 날짜가 포함되어 있습니다. 오늘 이후로만 선택하세요."
+                    
         # 시트 존재
         missing = [n for n in ("logs","balances","schedule_weekly","holidays") if not sheet_exists(n)]
         if missing:
@@ -768,11 +844,7 @@ def admin_modal(ack, body, client):
                  "element":{"type":"datepicker","action_id":"date_start"}},
                 {"type":"input","block_id":"date_end_b","optional":True,"label":{"type":"plain_text","text":"종료일"},
                  "element":{"type":"datepicker","action_id":"date_end"}},
-                # 주말 포함 옵션(결정 2번 참조)
-                {"type":"input","block_id":"opt_biz","optional":True,"label":{"type":"plain_text","text":"옵션"},
-                 "element":{"type":"checkboxes","action_id":"biz_opt","options":[
-                   {"text":{"type":"plain_text","text":"주말/공휴일 포함"},"value":"include_weekends"}
-                 ]}},
+                # 메모
                 {"type":"input","block_id":"note_b","optional":True,"label":{"type":"plain_text","text":"메모"},
                  "element":{"type":"plain_text_input","action_id":"note"}}
             ]}
@@ -828,25 +900,43 @@ def admin_submit(ack, body, view, client, logger):
     if errors: return ack_errors(errors)
 
     # 3) 연도/과거일 정책(관리자 플래그 적용)
-    def _safe_date(s): return parse_ymd_safe(s) if s else None
-    def _safe_year(s): d=_safe_date(s); return d.year if d else None
+    def _safe_date(s): 
+        return parse_ymd_safe(s) if s else None
+    def _safe_year(s): 
+        d=_safe_date(s); 
+        return d.year if d else None
+    
     thisy=today_kst_date().year
-    y0=_safe_year(date_start); y1=_safe_year(date_end) or y0
+    
+    y0=_safe_year(date_start); 
+    y1=_safe_year(date_end) or y0
+    
     if not ALLOW_FUTURE_YEAR_ADMIN:
-        if action=="halfday" and y0 and y0>thisy: errors["date_start_b"]=f"{thisy}년 이후 날짜는 등록할 수 없습니다."
+        if action=="halfday" and y0 and y0>thisy: 
+            errors["date_start_b"]=f"{thisy}년 이후 날짜는 등록할 수 없습니다."
         elif action in ("annual","off") and y0 and y1:
-            if max(y0,y1)>thisy: errors["date_start_b"]=f"{thisy}년 이후 날짜가 포함되어 있습니다."
-            elif y0!=y1: errors["date_start_b"]="두 해에 걸친 기간은 나눠서 등록하세요."
+            if max(y0,y1)>thisy: 
+                errors["date_start_b"]=f"{thisy}년 이후 날짜가 포함되어 있습니다."
+            elif y0!=y1: 
+                errors["date_start_b"]="두 해에 걸친 기간은 나눠서 등록하세요."
     if not ALLOW_BACKDATE_ADMIN:
-        d0=_safe_date(date_start); d1=_safe_date(date_end) or d0; today=today_kst_date()
-        if action=="halfday" and d0 and d0<today: errors["date_start_b"]="지난 날짜에는 반차를 등록할 수 없습니다."
+        d0=_safe_date(date_start); 
+        d1=_safe_date(date_end) or d0; 
+        today=today_kst_date()
+        if action=="halfday" and d0 and d0<today: 
+            errors["date_start_b"]="지난 날짜에는 반차를 등록할 수 없습니다."
         elif action in ("annual","off") and d0 and d1:
-            if d0==d1 and d0<today: errors["date_start_b"]="지난 날짜에는 등록할 수 없습니다."
-            elif d1<today or (d0<today<=d1): errors["date_start_b"]="지난 날짜가 포함되어 있습니다."
+            if d0==d1 and d0<today: 
+                errors["date_start_b"]="지난 날짜에는 등록할 수 없습니다."
+            elif d1<today or (d0<today<=d1): 
+                errors["date_start_b"]="지난 날짜가 포함되어 있습니다."
+                
     # 시트 존재
     miss=[n for n in ("logs","balances","schedule_weekly","holidays") if not sheet_exists(n)]
-    if miss: errors["action_b"]="시트가 없습니다: "+", ".join(miss)
-    if errors: return ack_errors(errors)
+    if miss: 
+        errors["action_b"]="시트가 없습니다: "+", ".join(miss)
+    if errors: 
+        return ack_errors(errors)
 
     # 4) 여기서 ACK (이후 I/O)
     ack()
@@ -1753,10 +1843,38 @@ def require_admin(user_id: str, client) -> tuple[bool, str]:
 
 # 명세: admin_requests 헤더 권장
 # ts | admin_key | target_key | op | params | status | reason
-def log_admin_action(ts: str, admin_key: str, target_key: str, op: str, params: dict, status: str, reason: str=""):
-    ws = get_ws("admin_requests")
-    row = [ts, admin_key, target_key, op, json.dumps(params, ensure_ascii=False), status, reason]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+def log_admin_action(admin_key: str, target_key: str, action: str,
+                     params: dict, status: str, reason: str = "") -> None:
+    """권장 통합 로거. v1/v2 헤더 자동 감지 후 맞게 기록."""
+    ws, ver = ensure_admin_requests_sheet()
+    ts = dt.datetime.now(KST).isoformat(timespec="seconds")
+
+    if ver == "v2":
+        row = [
+            ts,
+            admin_key or "",
+            target_key or "",
+            action or "",
+            json.dumps(params or {}, ensure_ascii=False),
+            status or "",
+            reason or "",
+        ]
+        with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+    else:
+        # v1 매핑: date/note만 분해하고 나머지는 result/error에 반영
+        date = (params or {}).get("date", "") or ""
+        note = (params or {}).get("note", "") or ""
+        row = [
+            ts,
+            admin_key or "",
+            target_key or "",
+            action or "",
+            date,
+            note,
+            status or "",
+            reason or "",
+        ]
+        with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
 
 # ---------- /잔여갱신 커맨드 + 모달 제출 핸들러 ----------
 @app.command("/잔여갱신")
@@ -2066,18 +2184,15 @@ def explain_skip_for_annual(user_key: str, ds: str, *, alt_user_key: str | None 
 
 # --- 연차 기간 제출 시, 저장 가능한 날짜들과 스킵(사유) 목록 반환 ---
 def resolve_annual_savables(user_key: str, start_s: str, end_s: str, *, alt_user_key: str | None = None):
-    """
-    연차 기간 제출 시, 저장 가능한 날짜들과 스킵(사유) 목록을 돌려준다.
-    반환: (savable_dates: list[str], skips: list[tuple[str, str]])
-    """
     dates_all = list(iter_dates(start_s, end_s))
     savable, skips = [], []
     for ds in dates_all:
-        reason = explain_skip_for_annual(user_key, ds, alt_user_key=alt_user_key)
-        if reason:
-            skips.append((ds, reason))
-        else:
-            savable.append(ds)
+        d = parse_ymd_safe(ds)
+        if not is_business_day(d):              # 주말/공휴일 스킵
+            skips.append((ds, "주말/공휴일은 연차 기록 대상이 아닙니다.")); continue
+        reason = explain_skip_for_annual(user_key, ds, alt_user_key=alt_user_key)  # 반차 충돌/중복 등
+        if reason: skips.append((ds, reason))
+        else: savable.append(ds)
     return savable, skips
 
 def today_kst_date() -> dt.date:
