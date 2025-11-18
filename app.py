@@ -9,6 +9,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google.oauth2.service_account import Credentials
 from typing import Callable
 from datetime import timedelta
+from gspread.exceptions import APIError
 
 load_dotenv()
 
@@ -28,6 +29,9 @@ DEDUP_WINDOW_SEC = 60          # 동일 사용자/타입/날짜 60초 내 중복
 DAILY_UNIQUE = {"checkin","checkout"}  # 하루 1회만 허용하는 타입
 
 DOW_COLS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
+RETRY_MAX = 6
+RETRY_BASE = 0.4  # seconds
 
 # 캐시
 user_cache = {}
@@ -176,19 +180,25 @@ def get_ws(name: str):
     return sh.worksheet(name)
 
 # --- 지수적 백오프 재시도 ---
-def with_retry(fn, retries=5, base=0.2, max_sleep=2.0):
-    """
-    지수적 백오프 재시도. gspread 네트워크/429 방어.
-    """
-    last = None
-    for i in range(retries):
+def with_retry(fn):
+    for i in range(RETRY_MAX):
         try:
             return fn()
-        except Exception as e:
-            last = e
-            sleep = min(max_sleep, base * (2 ** i) + random.uniform(0, base))
+        except APIError as e:
+            # gspread APIError: e.response.status_code 사용 가능
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (429, 500, 502, 503, 504):
+                sleep = RETRY_BASE * (2 ** i) + random.uniform(0, 0.3)
+                time.sleep(sleep)
+                continue
+            raise
+        except Exception:
+            # 네트워크 일시 오류류도 동일 전략(선택)
+            sleep = RETRY_BASE * (2 ** i) + random.uniform(0, 0.3)
             time.sleep(sleep)
-    raise last
+            continue
+    # 마지막 실패를 명확히
+    raise RuntimeError("Google Sheets에 일시적으로 접근할 수 없습니다. 잠시 후 다시 시도해주세요.")
 
 # --- 예외를 사람이 읽을 수 있는 메시지로 변환 ---            
 def human_error(e: Exception) -> str:
@@ -364,12 +374,20 @@ def dup_error_msg_for(action: str, user_key: str, date_str: str, half_period: st
 
 # --- admin_requests 시트 및 버전 확인 ---
 def ensure_admin_requests_sheet() -> tuple:
-    """admin_requests 시트 핸들 + 스키마 버전('v1' or 'v2') 반환.
-       없거나 비어 있으면 v2로 생성."""
-    ws = get_ws("admin_requests")
+    """admin_requests 시트 핸들 + 스키마 버전('v1' or 'v2'). 없으면 생성."""
+    try:
+        ws = get_ws("admin_requests")
+    except Exception:
+        # 없으면 생성
+        sh = get_sh()
+        try:
+            ws = with_retry(lambda: sh.add_worksheet(title="admin_requests", rows=1000, cols=10))
+        except Exception:
+            # 동시 생성 경합 대비 재시도
+            ws = get_ws("admin_requests")
+
     vals = ws.get_all_values() or []
     if not vals:
-        # v2로 생성
         ws.append_row(
             ["ts_iso","admin_key","target_key","action","params_json","status","reason"],
             value_input_option="USER_ENTERED",
@@ -382,17 +400,8 @@ def ensure_admin_requests_sheet() -> tuple:
         return ws, "v2"
     if {"ts_iso","admin_key","target_key","action","date","note","result","error"} <= hset:
         return ws, "v1"
+    return ws, "v1"  # 알 수 없는 헤더면 v1로 취급(기록은 됨)
 
-    # 알 수 없는 헤더면 v2로 재정렬(권장) — 필요시 주석 해제
-    # ws.clear()
-    # ws.append_row(
-    #     ["ts_iso","admin_key","target_key","action","params_json","status","reason"],
-    #     value_input_option="USER_ENTERED",
-    # )
-    # return ws, "v2"
-
-    # 헤더 유지 + v1로 간주 (날짜/메모만 쓰는 보수 경로)
-    return ws, "v1"
 
 # --- 관리자 요청 시트 및 버전 확인 ---
 def log_admin_action(admin_key: str, target_key: str, action: str,
@@ -948,10 +957,23 @@ def admin_submit(ack, body, view, client, logger):
     admin_key  = safe_user_key(client, admin_uid)
 
     saved, failed, skips = [], [], []
+    action_human = "연차" if action=="annual" else ("반차" if action=="halfday" else "휴무")
+
+    # 로깅용 공통 파라미터 초깃값
+    params_for_log = {
+        "action": action,
+        "target_uid": target_uid,
+        "date_start": date_start,
+        "date_end": date_end,
+        "note": note,
+        "saved": [],
+        "failed": [],
+        "skipped": [],
+    }
 
     try:
         if action=="halfday":
-            ds=date_start
+            ds = date_start
             note_final = note + (" (오전)" if half_period=="am" else " (오후)")
             guard_and_append(target_key, target_name, "halfday",
                              note=note_final, date_str=ds, by_user=admin_key,
@@ -959,18 +981,10 @@ def admin_submit(ack, body, view, client, logger):
             saved.append(ds)
 
         elif action=="annual":
-            if not date_end: date_end=date_start
-            # 주말 포함 옵션 반영
-            if include_weekends:
-                dates = list(iter_dates(date_start, date_end))
-            else:
-                # 기존 정책 유지: 사업일만
-                # + 반차 충돌/중복/연차중복 체크는 guard에서 처리되며, 실패는 failed에 기록
-                dates = [d for d in iter_dates(date_start, date_end) if is_business_day(parse_ymd_safe(d))]
-
+            if not date_end: date_end = date_start
+            dates = [d for d in iter_dates(date_start, date_end) if is_business_day(parse_ymd_safe(d))]
             for ds in dates:
                 try:
-                    # 상호배타/중복/별칭 규칙 동일 + 관리자 플래그
                     guard_and_append(target_key, target_name, "annual",
                                      note=note, date_str=ds, by_user=admin_key,
                                      alt_user_key=target_uid, is_admin=True)
@@ -987,6 +1001,15 @@ def admin_submit(ack, body, view, client, logger):
                     saved.append(ds)
                 except Exception as e:
                     failed.append((ds, human_error(e)))
+
+    except Exception as e:
+        # 처리 중 치명 예외 → 실패 로깅
+        params_for_log["failed"] = failed
+        params_for_log["saved"] = saved
+        params_for_log["skipped"] = skips
+        log_admin_action(admin_key, target_key, action, params_for_log, "fail", human_error(e))
+        raise
+    
     finally:
         # 결과 에페메럴
         ch = (json.loads(view.get("private_metadata") or "{}").get("channel_id")) or admin_uid
@@ -995,13 +1018,23 @@ def admin_submit(ack, body, view, client, logger):
             if isinstance(items[0], tuple): body="\n".join(f"- {d} : {m}" for d,m in items)
             else: body="\n".join(f"- {d}" for d in items)
             return f"\n*{title}*\n{body}"
-        client.chat_postEphemeral(
-            channel=ch, user=admin_uid,
-            text=(f"*관리자 {('연차' if action=='annual' else '반차' if action=='halfday' else '휴무')} 등록 결과* "
-                  f"({date_start}" + (f" ~ {date_end}" if date_end and date_end!=date_start else "") + ")\n"
-                  + section("저장됨", saved) + section("실패함(오류)", failed))
-        )
 
+        try:
+            client.chat_postEphemeral(
+                channel=ch, user=admin_uid,
+                text=(f"*관리자 {action_human} 등록 결과* "
+                      f"({date_start}" + (f" ~ {date_end}" if date_end and date_end!=date_start else "") + ")\n"
+                      + section("저장됨", saved) + section("실패함(오류)", failed))
+            )
+        finally:
+            # 성공/실패 상관없이 최종 로그 남김
+            params_for_log["failed"] = failed
+            params_for_log["saved"] = saved
+            params_for_log["skipped"] = skips
+            status = "ok" if saved and not failed else ("partial" if saved and failed else "fail")
+            reason = "" if status!="fail" else "모든 항목 실패"
+            log_admin_action(admin_key, target_key, action, params_for_log, status, reason)
+            
 # =========================================================
 # balances / 잔여 계산 유틸
 # ---------------------------------------------------------
